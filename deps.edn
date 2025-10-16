@@ -1,0 +1,13 @@
+{:paths ["src"]
+ :deps
+ {org.clojure/clojure {:mvn/version "1.12.0"}
+  org.clojure/core.async {:mvn/version "1.6.681"}
+  com.github.kwhat/jnativehook {:mvn/version "2.2.2"}
+  cheshire/cheshire {:mvn/version "5.13.0"}}
+
+ :aliases
+ {:run {:main-opts ["-m" "jarvis.core"]}
+  :repl {:extra-paths ["dev"]
+         :extra-deps {nrepl/nrepl {:mvn/version "1.0.0"}
+                      cider/cider-nrepl {:mvn/version "0.45.0"}}
+         :main-opts ["-m" "nrepl.cmdline" "--middleware" "[cider.nrepl/cider-middleware]"]}}}

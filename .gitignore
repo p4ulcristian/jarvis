@@ -1,0 +1,28 @@
+# Clojure
+.cpcache/
+.lsp/
+*.jar
+target/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temp files
+*.wav
+*.tmp
+*.log
