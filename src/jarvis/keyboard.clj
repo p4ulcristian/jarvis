@@ -5,6 +5,7 @@
            [java.util.logging Level Logger]))
 
 (def ^:private control-pressed (atom false))
+(def ^:private other-key-pressed (atom false))
 (def ^:private listener-registered (atom false))
 
 ;; Suppress JNativeHook logging noise
@@ -20,17 +21,27 @@
     (nativeKeyPressed [this event]
       (let [key-code (.getKeyCode event)
             modifiers (.getModifiers event)]
-        ;; Check for Ctrl key (key code 17)
-        (when (= key-code 17)
-          (reset! control-pressed true)
-          (async/put! events-chan {:event :ctrl-pressed :timestamp (System/currentTimeMillis)}))))
+        ;; Check for Ctrl key (key code 17 for left Ctrl, 163 for right Ctrl)
+        (if (or (= key-code 17) (= key-code 163))
+          (do
+            (reset! control-pressed true)
+            (reset! other-key-pressed false)
+            (async/put! events-chan {:event :ctrl-pressed :timestamp (System/currentTimeMillis)}))
+          ;; Some other key was pressed
+          (when @control-pressed
+            (reset! other-key-pressed true)))))
 
     (nativeKeyReleased [this event]
       (let [key-code (.getKeyCode event)]
-        ;; Check for Ctrl key (key code 17)
-        (when (= key-code 17)
-          (reset! control-pressed false)
-          (async/put! events-chan {:event :ctrl-released :timestamp (System/currentTimeMillis)}))))
+        ;; Check for Ctrl key (key code 17 for left Ctrl, 163 for right Ctrl)
+        (when (or (= key-code 17) (= key-code 163))
+          ;; Ctrl was released - check if it was pressed alone
+          (let [was-alone (not @other-key-pressed)]
+            (reset! control-pressed false)
+            (reset! other-key-pressed false)
+            (if was-alone
+              (async/put! events-chan {:event :ctrl-alone :timestamp (System/currentTimeMillis)})
+              (async/put! events-chan {:event :ctrl-released :timestamp (System/currentTimeMillis)}))))))
 
     (nativeKeyTyped [this event]
       ;; We don't need this event

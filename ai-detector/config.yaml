@@ -1,0 +1,38 @@
+# AI Detection System Configuration
+
+# Name of your AI assistant
+ai_name: "Alex"
+
+# Path to conversation log file (JSONL format)
+log_file: "/home/paul/Work/jarvis/ai-detector/conversation.jsonl"
+
+# Model settings
+model:
+  # Path to the GGUF model file
+  model_path: "/home/paul/Work/jarvis/ai-detector/models/llama-3.2-1b-q4_k_m.gguf"
+
+  # Number of GPU layers to offload (-1 for all, 0 for CPU only)
+  n_gpu_layers: 0
+
+  # Context window size
+  n_ctx: 2048
+
+  # Temperature for generation (lower = more deterministic)
+  temperature: 0.3
+
+  # Max tokens to generate
+  max_tokens: 10
+
+# Detection settings
+detection:
+  # Confidence threshold (0.0 to 1.0)
+  # Higher = stricter detection, fewer false positives
+  threshold: 0.7
+
+  # Enable verbose logging
+  verbose: true
+
+# Output settings
+output:
+  # Log detection results to this file
+  detection_log: "/home/paul/Work/jarvis/ai-detector/detections.log"
