@@ -1,5 +1,4 @@
 (ns jarvis.audio
-  (:require [clojure.core.async :as async])
   (:import [javax.sound.sampled AudioFormat AudioSystem TargetDataLine SourceDataLine]
            [java.io File]
            [javax.sound.sampled AudioFileFormat$Type]))
