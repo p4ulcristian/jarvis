@@ -1,0 +1,14 @@
+# JARVIS - Voice-to-Text System Requirements
+
+# NeMo ASR
+nemo_toolkit[asr]
+torch>=2.0.0
+
+# Audio
+pyaudio
+numpy
+
+# Keyboard & typing
+pynput
+
+# Utilities
