@@ -1,12 +1,28 @@
 #!/usr/bin/env python3
 """
 AI Detection Module - Detects when messages are directed at AI assistant.
+Uses DistilBERT-MNLI for fast zero-shot classification with rule-based pre-filtering.
 """
 
 import os
-from typing import Optional
-from llama_cpp import Llama
+import re
+from typing import Optional, List
 import yaml
+from transformers import pipeline
+
+# NLTK for sentence tokenization
+try:
+    import nltk
+    from nltk.tokenize import sent_tokenize
+    # Try to use punkt tokenizer, download if needed
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        print("[INFO] Downloading NLTK punkt tokenizer...")
+        nltk.download('punkt', quiet=True)
+except ImportError:
+    print("[WARNING] NLTK not installed. Install with: pip install nltk")
+    sent_tokenize = None
 
 
 class AIDetector:
@@ -22,98 +38,154 @@ class AIDetector:
         self.ai_name = self.config['ai_name']
         self.threshold = self.config['detection']['threshold']
         self.verbose = self.config['detection'].get('verbose', False)
+        self.use_model = self.config['model'].get('use_model', False)
 
-        # Initialize model
-        model_config = self.config['model']
+        # Compile regex patterns for command detection
+        name_pattern = re.escape(self.ai_name.lower())
 
-        if self.verbose:
-            print(f"Loading model from {model_config['model_path']}...")
+        # Patterns that indicate commanding/addressing
+        self.command_patterns = [
+            rf'\b{name_pattern}\s*,',  # "Jarvis, ..."
+            rf'^{name_pattern}\s+\w+',  # "Jarvis do..."
+            rf'\bhey\s+{name_pattern}\b',  # "hey Jarvis"
+            rf'\bok(?:ay)?\s+{name_pattern}\b',  # "okay Jarvis"
+            rf'{name_pattern}\s+(?:can|could|will|please)\b',  # "Jarvis can/could/will/please..."
+            rf'{name_pattern}\s+(?:would|could)\s+you\b',  # "Jarvis would you..." / "Jarvis could you..."
+        ]
 
-        self.model = Llama(
-            model_path=model_config['model_path'],
-            n_gpu_layers=model_config.get('n_gpu_layers', -1),
-            n_ctx=model_config.get('n_ctx', 2048),
-            verbose=self.verbose
-        )
+        # Patterns that indicate just mentioning
+        self.mention_patterns = [
+            rf'\b{name_pattern}\s+is\b',  # "Jarvis is..."
+            rf'\b{name_pattern}\s+would\s+(?!you)\w+',  # "Jarvis would like..." (but not "Jarvis would you")
+            rf'\bwas\s+\w+\s+{name_pattern}\b',  # "was talking to Jarvis"
+            rf'\btell\s+{name_pattern}\b',  # "tell Jarvis"
+            rf'\btalking\s+to\s+{name_pattern}\b',  # "talking to Jarvis"
+        ]
 
-        if self.verbose:
-            print("Model loaded successfully!")
+        # Only load model if explicitly enabled
+        self.classifier = None
+        if self.use_model:
+            model_config = self.config['model']
+            model_name = model_config.get('model_name', 'typeform/distilbert-base-uncased-mnli')
 
-    def is_message_for_ai(self, message: str) -> bool:
+            if self.verbose:
+                print(f"Loading model {model_name}...")
+
+            self.classifier = pipeline(
+                "zero-shot-classification",
+                model=model_name,
+                device=model_config.get('device', -1)  # -1 for CPU, 0 for GPU
+            )
+
+            self.labels = [
+                f"addressing {self.ai_name} directly",
+                f"talking about {self.ai_name}"
+            ]
+
+            if self.verbose:
+                print("Model loaded successfully!")
+        elif self.verbose:
+            print("Using rule-based detection (model disabled)")
+
+    def extract_last_sentences(self, text: str, n: int = 5) -> str:
+        """
+        Extract the last N sentences from the text buffer.
+
+        Args:
+            text: The full text buffer
+            n: Number of sentences to extract (default: 5)
+
+        Returns:
+            The last N sentences joined together
+        """
+        if not sent_tokenize:
+            # Fallback: return last 500 characters if NLTK not available
+            return text[-500:] if len(text) > 500 else text
+
+        sentences = sent_tokenize(text)
+        last_n = sentences[-n:] if len(sentences) > n else sentences
+        return " ".join(last_n)
+
+    def is_message_for_ai(self, message: str, use_sentences: bool = True, n_sentences: int = 5) -> bool:
         """
         Determine if a message is directed at or about the AI assistant.
 
         Args:
-            message: The message to analyze
+            message: The message/buffer to analyze
+            use_sentences: If True, extract last N sentences from message (default: True)
+            n_sentences: Number of sentences to extract if use_sentences is True (default: 5)
 
         Returns:
             True if message is directed at AI, False otherwise
         """
 
-        # Build the prompt
-        prompt = self._build_prompt(message)
-
-        # Get model response
-        response = self.model(
-            prompt,
-            max_tokens=self.config['model'].get('max_tokens', 10),
-            temperature=self.config['model'].get('temperature', 0.3),
-            stop=["\n"],
-            echo=False
-        )
-
-        # Extract answer
-        answer = response['choices'][0]['text'].strip().upper()
-
-        if self.verbose:
-            print(f"\nMessage: {message}")
-            print(f"Answer: {answer}")
-
-        # Parse response
-        return self._parse_response(answer)
-
-    def _build_prompt(self, message: str) -> str:
-        """Build the detection prompt using Llama 3.2 chat format."""
-
-        # Use Llama 3.2 instruction format
-        prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-
-You are a classifier. Determine if a message is directly addressing or calling an AI named "{self.ai_name}". Answer only YES or NO.
-
-YES examples:
-- "{self.ai_name}, help me" (direct address)
-- "Hey {self.ai_name}" (greeting)
-- "Can you explain this?" (request to AI in conversation)
-
-NO examples:
-- "I talked to {self.ai_name}" (past reference)
-- "{self.ai_name} is nice" (statement about)
-- "Tell {self.ai_name} I said hi" (indirect reference)<|eot_id|><|start_header_id|>user<|end_header_id|>
-
-Message: "{message}"
-Is this directly addressing {self.ai_name}?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-
-"""
-
-        return prompt
-
-    def _parse_response(self, answer: str) -> bool:
-        """Parse the model's response to a boolean."""
-
-        # Check for YES/NO in response
-        if "YES" in answer:
-            return True
-        elif "NO" in answer:
-            return False
+        # Extract last N sentences if requested
+        if use_sentences and sent_tokenize:
+            analysis_text = self.extract_last_sentences(message, n_sentences)
         else:
-            # If unclear, default to False (conservative approach)
+            analysis_text = message
+
+        text_lower = analysis_text.lower()
+
+        # First check if AI name is mentioned at all
+        if self.ai_name.lower() not in text_lower:
             if self.verbose:
-                print(f"Warning: Unclear response '{answer}', defaulting to NO")
+                print(f"\nBuffer: {message[:100]}..." if len(message) > 100 else f"\nBuffer: {message}")
+                if use_sentences:
+                    print(f"Analyzed text (last {n_sentences} sentences): {analysis_text}")
+                print(f"AI name '{self.ai_name}' not found in text")
             return False
+
+        # Rule-based detection
+        # Check for mention patterns first (these override commanding)
+        for pattern in self.mention_patterns:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                if self.verbose:
+                    print(f"\nBuffer: {message[:100]}..." if len(message) > 100 else f"\nBuffer: {message}")
+                    if use_sentences:
+                        print(f"Analyzed text (last {n_sentences} sentences): {analysis_text}")
+                    print(f"Matched mention pattern: {pattern}")
+                return False
+
+        # Check for command patterns
+        for pattern in self.command_patterns:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                if self.verbose:
+                    print(f"\nBuffer: {message[:100]}..." if len(message) > 100 else f"\nBuffer: {message}")
+                    if use_sentences:
+                        print(f"Analyzed text (last {n_sentences} sentences): {analysis_text}")
+                    print(f"Matched command pattern: {pattern}")
+                return True
+
+        # If we have the model and no clear pattern match, use it
+        if self.classifier is not None:
+            result = self.classifier(analysis_text, self.labels)
+            top_label = result['labels'][0]
+            top_score = result['scores'][0]
+
+            if self.verbose:
+                print(f"\nBuffer: {message[:100]}..." if len(message) > 100 else f"\nBuffer: {message}")
+                if use_sentences:
+                    print(f"Analyzed text (last {n_sentences} sentences): {analysis_text}")
+                print(f"No pattern match, using model")
+                print(f"Top label: {top_label} (score: {top_score:.3f})")
+                print(f"All results: {list(zip(result['labels'], result['scores']))}")
+
+            is_commanding = top_label == f"addressing {self.ai_name} directly"
+            is_confident = top_score >= self.threshold
+            return is_commanding and is_confident
+
+        # Default: if name is mentioned but no pattern matches and no model, be conservative
+        if self.verbose:
+            print(f"\nBuffer: {message[:100]}..." if len(message) > 100 else f"\nBuffer: {message}")
+            if use_sentences:
+                print(f"Analyzed text (last {n_sentences} sentences): {analysis_text}")
+            print(f"No pattern match, defaulting to False")
+        return False
 
     def close(self):
         """Clean up resources."""
-        # llama-cpp-python handles cleanup automatically
+        # Transformers pipeline handles cleanup automatically
         pass
 
 
@@ -123,20 +195,29 @@ def main():
     detector = AIDetector()
 
     test_messages = [
-        "Hey Alex, can you help me?",
-        "I was talking to Alex yesterday",
-        "Alex is a nice name",
-        "What do you think about this?",
+        # Should trigger (commanding)
+        "Jarvis, turn on the lights",
+        "Hey Jarvis, what time is it?",
+        "Jarvis can you help me with this?",
+        "Okay Jarvis, start the music",
+
+        # Should NOT trigger (mentioning)
+        "Jarvis is a wonderful name",
+        "I was talking to Jarvis yesterday",
+        "I think Jarvis would like this",
+        "Tell Jarvis I said hello",
+
+        # Edge cases
         "The weather is nice today",
-        "Alex, what time is it?",
+        "What do you think about this?",
     ]
 
     print("\n" + "=" * 60)
-    print("Testing AI Detection")
+    print("Testing AI Detection (DistilBERT-MNLI)")
     print("=" * 60)
 
     for msg in test_messages:
-        result = detector.is_message_for_ai(msg)
+        result = detector.is_message_for_ai(msg, use_sentences=False)
         status = "✓ TRIGGER" if result else "✗ IGNORE"
         print(f"\n{status}: {msg}")
 

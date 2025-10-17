@@ -1,13 +1,22 @@
 (ns jarvis.core
   (:require [jarvis.audio :as audio]
-           [jarvis.whisper :as whisper]
+           [jarvis.nemo :as nemo]
            [jarvis.typer :as typer]
+           [jarvis.logger :as logger]
            [clojure.java.io :as io])
   (:gen-class))
 
 (def ^:private shutdown-signal (atom false))
 (def ^:private trigger-file "/tmp/jarvis-type-trigger")
 (def ^:private last-trigger-time (atom 0))
+
+;; Rolling buffer for AI detection (stores last 5 minutes)
+(def ^:private transcription-buffer (atom []))
+(def ^:private five-minutes-ms (* 5 60 1000))
+
+;; AI detection state
+(def ^:private last-detection-time (atom 0))
+(def ^:private detection-cooldown-ms (* 30 1000)) ;; 30 seconds cooldown
 
 ;; Keyboard listener state
 (def ^:private keyboard-listener-process (atom nil))
@@ -17,7 +26,61 @@
 
 (defn get-temp-audio-file []
   "Generate a temporary audio file path"
-  (str (System/getProperty "java.io.tmpdir") "/whisper_" (System/currentTimeMillis) ".wav"))
+  (str (System/getProperty "java.io.tmpdir") "/nemo_" (System/currentTimeMillis) ".wav"))
+
+;; ============================================================================
+;; Rolling Buffer Management
+;; ============================================================================
+
+(defn add-to-buffer [text]
+  "Add a transcription to the buffer with current timestamp"
+  (let [entry {:text text
+               :timestamp (System/currentTimeMillis)}]
+    (swap! transcription-buffer conj entry)))
+
+(defn clean-buffer []
+  "Remove entries older than 5 minutes from the buffer"
+  (let [now (System/currentTimeMillis)
+        cutoff (- now five-minutes-ms)]
+    (swap! transcription-buffer
+           (fn [buffer]
+             (filterv #(> (:timestamp %) cutoff) buffer)))))
+
+(defn get-buffer-text []
+  "Get all text from the buffer as a single string"
+  (clean-buffer)
+  (clojure.string/join " " (map :text @transcription-buffer)))
+
+;; ============================================================================
+;; AI Detection
+;; ============================================================================
+
+(defn check-ai-detection []
+  "Check if the buffer text is directed at the AI (with cooldown)"
+  (try
+    ;; Check cooldown
+    (let [now (System/currentTimeMillis)
+          time-since-last-detection (- now @last-detection-time)]
+      (if (< time-since-last-detection detection-cooldown-ms)
+        ;; Still in cooldown, skip detection
+        false
+        ;; Cooldown expired, check for detection
+        (let [buffer-text (get-buffer-text)]
+          ;; Only check if we have some text
+          (when (> (.length buffer-text) 0)
+            (let [python-path (.getAbsolutePath (java.io.File. "ai-detector/venv/bin/python"))
+                  script-path (.getAbsolutePath (java.io.File. "ai-detector/ai_detector_cli.py"))
+                  process (.exec (Runtime/getRuntime)
+                               (into-array String [python-path script-path buffer-text]))
+                  exit-code (.waitFor process)]
+              ;; Exit code 0 means YES (detected), 1 means NO
+              (when (= exit-code 0)
+                ;; Detection occurred, update last detection time
+                (reset! last-detection-time now)
+                true))))))
+    (catch Exception e
+      (println "[ERROR] AI detection failed:" (.getMessage e))
+      false)))
 
 (defn check-trigger-file []
   "Check if trigger file has been modified since last check"
@@ -129,10 +192,12 @@
       (let [file-size (.length (java.io.File. audio-file))]
         ;; Check if audio is not silent
         (if (> file-size 20000)
-          (let [result (whisper/transcribe-audio audio-file)]
+          (let [result (nemo/transcribe-audio audio-file)]
             (if (:success result)
               (let [text (:text result)]
                 (when (and text (> (.length text) 0))
+                  ;; Log the transcription
+                  (logger/log-conversation text "user")
                   (println "\n" (apply str (repeat 60 "=")))
                   (println "[TYPING]")
                   (println text)
@@ -161,10 +226,12 @@
       (let [file-size (.length (java.io.File. audio-file))]
         ;; Check if audio is not silent
         (if (> file-size 20000)
-          (let [result (whisper/transcribe-audio audio-file)]
+          (let [result (nemo/transcribe-audio audio-file)]
             (if (:success result)
               (let [text (:text result)]
                 (when (and text (> (.length text) 0))
+                  ;; Log the transcription
+                  (logger/log-conversation text "user")
                   (println "\n" (apply str (repeat 60 "=")))
                   (println "[WILL TYPE]")
                   (println text)
@@ -226,7 +293,7 @@
               (if (> file-size 20000)
                 ;; Audio file is large enough
                 (let [transcribe-start-time (System/currentTimeMillis)
-                      result (whisper/transcribe-audio audio-file)
+                      result (nemo/transcribe-audio audio-file)
                       transcribe-end-time (System/currentTimeMillis)]
                   (if (:success result)
                     (let [text (:text result)
@@ -234,11 +301,21 @@
                           recording-time (- record-end-time start-time)
                           transcription-time (- transcribe-end-time transcribe-start-time)]
                       (when (and text (> (.length text) 0))
+                        ;; Add to buffer for AI detection
+                        (add-to-buffer text)
+
+                        ;; Log the transcription
+                        (logger/log-conversation text "user")
                         (println "\n" (apply str (repeat 60 "=")))
                         (println "[" (.toString (java.time.LocalTime/now)) "]")
                         (println (format "[TIMING] Total: %dms | Recording: %dms | Transcription: %dms"
                                        total-time recording-time transcription-time))
                         (println text)
+
+                        ;; Check for AI detection
+                        (when (check-ai-detection)
+                          (println "\n>>> [AI DETECTED] Message addressed to AI! <<<"))
+
                         (println (apply str (repeat 60 "=")))
                         (flush)))
                     (println "[ERROR] Transcription failed:" (:error result))))
@@ -258,35 +335,35 @@
     (println "╚════════════════════════════════════════════════════════════╝")
     (flush)
 
-    ;; Start Whisper server
-    (println "\n[INIT] Starting Whisper server...")
+    ;; Check NeMo server
+    (println "\n[INIT] Checking NeMo server connection...")
     (flush)
-    (let [script-path (.getAbsolutePath (java.io.File. "whisper_server.py"))]
-      (if (whisper/start-whisper-server script-path)
-        (do
-          (println "[OK] Whisper server ready")
-          (flush)
+    (if (nemo/start-nemo-server)
+      (do
+        (println "[OK] NeMo server ready")
+        (flush)
 
-          ;; Start keyboard listener
-          (println "[INIT] Starting keyboard listener...")
-          (flush)
-          (let [script-path (.getAbsolutePath (java.io.File. "keyboard_listener.py"))]
-            (if (start-keyboard-listener script-path)
-              (do
-                (println "[OK] Keyboard listener ready (Ctrl for push-to-talk)")
-                (flush))
-              (do
-                (println "[WARNING] Keyboard listener failed to start")
-                (println "[INFO] Push-to-talk will not be available")
-                (flush))))
+        ;; Start keyboard listener
+        (println "[INIT] Starting keyboard listener...")
+        (flush)
+        (let [script-path (.getAbsolutePath (java.io.File. "keyboard_listener.py"))]
+          (if (start-keyboard-listener script-path)
+            (do
+              (println "[OK] Keyboard listener ready (Ctrl for push-to-talk)")
+              (flush))
+            (do
+              (println "[WARNING] Keyboard listener failed to start")
+              (println "[INFO] Push-to-talk will not be available")
+              (flush))))
 
-          ;; Start logging
-          (continuous-logging)
-          true)
-        (do
-          (println "[ERROR] Failed to start Whisper server")
-          (flush)
-          false)))
+        ;; Start logging
+        (continuous-logging)
+        true)
+      (do
+        (println "[ERROR] Failed to connect to NeMo server")
+        (println "[INFO] Make sure Docker container is running: docker-compose up -d")
+        (flush)
+        false))
     (catch Exception e
       (println "[ERROR] Logger startup failed:" (.getMessage e))
       (.printStackTrace e)
@@ -298,7 +375,7 @@
   (flush)
   (reset! shutdown-signal true)
   (stop-keyboard-listener)
-  (whisper/stop-whisper-server)
+  (nemo/stop-nemo-server)
   (println "[OK] Goodbye!")
   (flush))
 

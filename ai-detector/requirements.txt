@@ -1,6 +1,5 @@
-llama-cpp-python==0.2.90
+transformers>=4.30.0
+torch>=2.0.0
 pyyaml==6.0.1
 watchdog==4.0.0
-
-# For GPU support (CUDA), install with:
-# CMAKE_ARGS="-DLLAMA_CUDA=on" pip install llama-cpp-python --force-reinstall --no-cache-dir
+nltk==3.8.1

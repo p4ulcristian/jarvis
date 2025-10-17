@@ -1,0 +1,20 @@
+# Use NVIDIA NeMo container as base
+FROM nvcr.io/nvidia/nemo:24.01.speech
+
+# Set working directory
+WORKDIR /app
+
+# Install additional Python dependencies
+RUN pip install --no-cache-dir fastapi uvicorn python-multipart
+
+# Copy the NeMo server script
+COPY nemo_server.py /app/nemo_server.py
+
+# Make the script executable
+RUN chmod +x /app/nemo_server.py
+
+# Expose port
+EXPOSE 8000
+
+# Run the server
+CMD ["python", "/app/nemo_server.py"]

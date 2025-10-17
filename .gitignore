@@ -26,3 +26,6 @@ venv/
 *.wav
 *.tmp
 *.log
+
+# Model files
+ai-detector/models/*.gguf

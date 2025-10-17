@@ -1,36 +1,35 @@
 # AI Detection System Configuration
 
 # Name of your AI assistant
-ai_name: "Alex"
+ai_name: "Jarvis"
 
 # Path to conversation log file (JSONL format)
 log_file: "/home/paul/Work/jarvis/ai-detector/conversation.jsonl"
 
 # Model settings
 model:
-  # Path to the GGUF model file
-  model_path: "/home/paul/Work/jarvis/ai-detector/models/llama-3.2-1b-q4_k_m.gguf"
+  # Use ML model for ambiguous cases (default: false, uses rule-based only)
+  # Rule-based detection is much faster and works well for most cases
+  use_model: false
 
-  # Number of GPU layers to offload (-1 for all, 0 for CPU only)
-  n_gpu_layers: 0
+  # Hugging Face model name for zero-shot classification (only if use_model: true)
+  # Fast options:
+  #   - typeform/distilbert-base-uncased-mnli (recommended - fast & accurate)
+  #   - MoritzLaurer/multilingual-MiniLMv2-L6-mnli-xnli (smaller, faster)
+  model_name: "typeform/distilbert-base-uncased-mnli"
 
-  # Context window size
-  n_ctx: 2048
-
-  # Temperature for generation (lower = more deterministic)
-  temperature: 0.3
-
-  # Max tokens to generate
-  max_tokens: 10
+  # Device: -1 for CPU, 0 for GPU (CUDA), 1+ for multi-GPU
+  device: -1
 
 # Detection settings
 detection:
   # Confidence threshold (0.0 to 1.0)
   # Higher = stricter detection, fewer false positives
-  threshold: 0.7
+  # For zero-shot classification, 0.5-0.7 is a good range
+  threshold: 0.65
 
   # Enable verbose logging
-  verbose: true
+  verbose: false
 
 # Output settings
 output:

@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  nemo:
+    build:
+      context: .
+      dockerfile: Dockerfile.nemo
+    container_name: jarvis-nemo
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    restart: unless-stopped
+    volumes:
+      # Optional: cache Hugging Face models
+      - ~/.cache/huggingface:/root/.cache/huggingface
