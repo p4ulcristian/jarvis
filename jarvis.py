@@ -14,6 +14,13 @@ import tempfile
 from pathlib import Path
 from datetime import datetime
 from collections import deque
+import logging
+import warnings
+
+# Suppress warnings and verbose output
+warnings.filterwarnings('ignore')
+logging.getLogger().setLevel(logging.ERROR)
+os.environ['PYTHONWARNINGS'] = 'ignore'
 
 import torch
 import nemo.collections.asr as nemo_asr
@@ -126,17 +133,16 @@ class Jarvis:
         """Transcribe audio file using NeMo"""
         try:
             with torch.no_grad():
-                result = self.model.transcribe([audio_file])
+                result = self.model.transcribe([audio_file], verbose=False)
 
             # Extract text from NeMo result
             if isinstance(result, (list, tuple)) and len(result) > 0:
                 first = result[0]
-                if isinstance(first, (list, tuple)) and len(first) > 0:
-                    text_elem = first[0]
-                    if isinstance(text_elem, (list, tuple)) and len(text_elem) > 0:
-                        text = str(text_elem[0])
-                    else:
-                        text = str(text_elem)
+                # Check if it has a .text attribute (Hypothesis object)
+                if hasattr(first, 'text'):
+                    text = first.text
+                elif isinstance(first, str):
+                    text = first
                 else:
                     text = str(first)
             else:
@@ -331,15 +337,11 @@ class Jarvis:
 
         if text:
             self.log_conversation(text)
-            print("\n" + "=" * 60)
-            print("[TYPING]")
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}]")
             print(text)
-            print("=" * 60)
             sys.stdout.flush()
 
             self.type_text(text)
-            print("[OK] Typed successfully")
-            sys.stdout.flush()
 
     def typing_mode(self):
         """Typing mode: record fixed duration and type with countdown"""
@@ -365,12 +367,8 @@ class Jarvis:
 
         if text:
             self.log_conversation(text)
-            print("\n" + "=" * 60)
-            print("[WILL TYPE]")
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}]")
             print(text)
-            print("=" * 60)
-            print("\n>>> CLICK WHERE YOU WANT TO TYPE NOW! <<<")
-            print("Typing in 3 seconds...")
             sys.stdout.flush()
 
             for i in range(3, 0, -1):
@@ -378,11 +376,7 @@ class Jarvis:
                 print(f"{i}...")
                 sys.stdout.flush()
 
-            print("[TYPING NOW]")
-            sys.stdout.flush()
             self.type_text(text)
-            print("[OK] Typed successfully")
-            sys.stdout.flush()
 
     def continuous_logging(self):
         """Main loop: continuous speech logging"""
