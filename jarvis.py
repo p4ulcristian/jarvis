@@ -6,6 +6,18 @@ Continuous speech logging with push-to-talk and typing modes
 
 import os
 import sys
+
+# Save original stderr
+_original_stderr = sys.stderr
+
+# Suppress ALSA warnings BEFORE importing pyaudio
+os.environ['PYTHONWARNINGS'] = 'ignore'
+os.environ['ALSA_CONFIG_PATH'] = '/dev/null'
+
+# Redirect stderr to /dev/null temporarily for ALSA imports
+_devnull = open(os.devnull, 'w')
+sys.stderr = _devnull
+
 import time
 import subprocess
 import tempfile
@@ -21,7 +33,6 @@ import warnings
 # Suppress warnings and verbose output
 warnings.filterwarnings('ignore')
 logging.getLogger().setLevel(logging.ERROR)
-os.environ['PYTHONWARNINGS'] = 'ignore'
 
 import torch
 import numpy as np
@@ -30,12 +41,19 @@ import pyaudio
 import wave
 from pynput.keyboard import Controller
 
+# Restore stderr after ALSA imports
+sys.stderr = _original_stderr
+_devnull.close()
+
+# Suppress NeMo's verbose logging
+import nemo.utils
+logging.getLogger('nemo_logger').setLevel(logging.ERROR)
+
 # Constants
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 1600  # 100ms chunks at 16kHz
 CHANNELS = 1
 TRIGGER_FILE = "/tmp/jarvis-type-trigger"
-KEYBOARD_STATE_FILE = "/tmp/jarvis-ctrl-state"
 LOG_FILE = "chat.txt"
 
 # Streaming ASR settings
@@ -58,6 +76,11 @@ WORD_CORRECTIONS = {
     'jarry': 'Jarvis',
     'jervis': 'Jarvis',
     'jarvie': 'Jarvis',
+    'jarvey': 'Jarvis',
+    'jadrice': 'Jarvis',
+    'jobies': 'Jarvis',
+    'jarbies': 'Jarvis',
+    'jeremies': 'Jarvis',
 }
 
 # AI Detection
@@ -74,14 +97,8 @@ class StreamingAudioBuffer:
         self.buffer = queue.Queue()
         self.is_active = False
 
-    def add_chunk(self, audio_data):
-        """Add audio chunk to buffer"""
-        # Convert int16 to float32 [-1, 1]
-        audio_float = audio_data.astype(np.float32) / 32768.0
-        self.buffer.put(audio_float)
-
     def get_chunk(self, timeout=0.1):
-        """Get next audio chunk"""
+        """Get next audio chunk as raw bytes"""
         try:
             return self.buffer.get(timeout=timeout)
         except queue.Empty:
@@ -242,6 +259,14 @@ class FrameASR:
         """Apply word-level corrections for common misrecognitions"""
         import re
 
+        # Filter out Cyrillic characters (Russian, Ukrainian, etc.)
+        # Keep only Latin, Hungarian, punctuation, and common symbols
+        text = re.sub(r'[А-Яа-яЁё]+', '', text)
+        text = re.sub(r'\s+', ' ', text).strip()  # Clean up extra spaces
+
+        if not text:
+            return ""
+
         # Split into words while preserving punctuation
         words = text.split()
         corrected_words = []
@@ -300,7 +325,18 @@ class TranscriptionBuffer:
 class Jarvis:
     def __init__(self):
         self.model = None
+
+        # Suppress ALSA warnings during PyAudio initialization
+        _stderr_backup = sys.stderr
+        sys.stderr = open(os.devnull, 'w')
         self.pyaudio = pyaudio.PyAudio()
+        sys.stderr.close()
+        sys.stderr = _stderr_backup
+
+        # Detect supported sample rate
+        self.device_sample_rate = self._detect_sample_rate()
+        self.needs_resampling = (self.device_sample_rate != SAMPLE_RATE)
+
         self.keyboard = Controller()
         self.transcription_buffer = TranscriptionBuffer()
         self.streaming_buffer = StreamingAudioBuffer()
@@ -317,12 +353,39 @@ class Jarvis:
         self.improved_log_path = Path("chat-revised.txt")
         self.improved_last_position = 0
 
+    def _detect_sample_rate(self):
+        """Detect a supported sample rate for the default input device"""
+        # Just use 48000 Hz which is widely supported
+        # Avoid multiple stream opens which can cause PyAudio/ALSA corruption
+        return 48000
+
+    def _resample_audio(self, audio_data, orig_rate, target_rate):
+        """Resample audio from orig_rate to target_rate using linear interpolation"""
+        if orig_rate == target_rate:
+            return audio_data
+
+        if len(audio_data) == 0:
+            return audio_data
+
+        # Calculate resampling ratio
+        ratio = target_rate / orig_rate
+        new_length = int(len(audio_data) * ratio)
+
+        if new_length == 0:
+            return np.array([], dtype=np.int16)
+
+        # Use numpy interpolation
+        try:
+            indices = np.linspace(0, len(audio_data) - 1, new_length)
+            resampled = np.interp(indices, np.arange(len(audio_data)), audio_data.astype(np.float64))
+            return resampled.astype(np.int16)
+        except Exception as e:
+            print(f"[ERROR] Resampling failed: {e}", file=sys.stderr)
+            return audio_data
+
     def load_model(self):
         """Load NeMo ASR model with word boosting"""
-        print("\n[INIT] Loading NeMo Parakeet-TDT-0.6B-v3 model...")
-        print("[INFO] Supports: English + Hungarian + 23 other EU languages")
-        print("[INFO] Word corrections enabled for: Jarvis")
-        sys.stdout.flush()
+        print("Loading NeMo Parakeet-TDT model...", end=' ', flush=True)
 
         try:
             self.model = nemo_asr.models.ASRModel.from_pretrained(
@@ -332,24 +395,20 @@ class Jarvis:
             if torch.cuda.is_available():
                 self.model = self.model.cuda()
                 device_name = torch.cuda.get_device_name(0)
-                gpu_mem = torch.cuda.memory_allocated(0) / 1024**3
-                print(f"[OK] Model loaded on GPU: {device_name}")
-                print(f"[OK] GPU Memory: {gpu_mem:.2f} GB")
+                print(f"✓ ({device_name})")
             else:
-                print("[WARNING] CUDA not available, using CPU")
+                print("✓ (CPU)")
 
             self.model.eval()
-            print("[OK] NeMo model ready!")
 
             # Initialize frame-based ASR for streaming
             self.frame_asr = FrameASR(self.model)
-            print("[OK] Streaming ASR initialized!")
 
             sys.stdout.flush()
             return True
 
         except Exception as e:
-            print(f"[ERROR] Failed to load model: {e}")
+            print(f"\n[ERROR] Failed to load model: {e}")
             return False
 
     def transcribe_audio(self, audio_file):
@@ -384,23 +443,33 @@ class Jarvis:
     def record_audio_chunk(self, duration_ms=2000):
         """Record audio for specified duration and return temp file path"""
         try:
+            device_chunk_size = int(CHUNK_SIZE * self.device_sample_rate / SAMPLE_RATE)
+
             stream = self.pyaudio.open(
                 format=pyaudio.paInt16,
                 channels=CHANNELS,
-                rate=SAMPLE_RATE,
+                rate=self.device_sample_rate,
                 input=True,
-                frames_per_buffer=CHUNK_SIZE
+                frames_per_buffer=device_chunk_size
             )
 
             frames = []
-            num_chunks = int(SAMPLE_RATE * duration_ms / (1000 * CHUNK_SIZE))
+            num_chunks = int(self.device_sample_rate * duration_ms / (1000 * device_chunk_size))
 
             for _ in range(num_chunks):
-                data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                data = stream.read(device_chunk_size, exception_on_overflow=False)
                 frames.append(data)
 
             stream.stop_stream()
             stream.close()
+
+            # Combine frames
+            audio_data = b''.join(frames)
+            audio_np = np.frombuffer(audio_data, dtype=np.int16)
+
+            # Resample if needed
+            if self.needs_resampling:
+                audio_np = self._resample_audio(audio_np, self.device_sample_rate, SAMPLE_RATE)
 
             # Save to temp file
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
@@ -411,7 +480,7 @@ class Jarvis:
             wf.setnchannels(CHANNELS)
             wf.setsampwidth(self.pyaudio.get_sample_size(pyaudio.paInt16))
             wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(b''.join(frames))
+            wf.writeframes(audio_np.tobytes())
             wf.close()
 
             return temp_path
@@ -423,20 +492,22 @@ class Jarvis:
     def record_until_condition(self, stop_condition, check_interval_ms=50):
         """Record audio until stop condition is met"""
         try:
+            device_chunk_size = int(CHUNK_SIZE * self.device_sample_rate / SAMPLE_RATE)
+
             stream = self.pyaudio.open(
                 format=pyaudio.paInt16,
                 channels=CHANNELS,
-                rate=SAMPLE_RATE,
+                rate=self.device_sample_rate,
                 input=True,
-                frames_per_buffer=CHUNK_SIZE
+                frames_per_buffer=device_chunk_size
             )
 
             frames = []
-            check_every_n_chunks = max(1, int(SAMPLE_RATE * check_interval_ms / (1000 * CHUNK_SIZE)))
+            check_every_n_chunks = max(1, int(self.device_sample_rate * check_interval_ms / (1000 * device_chunk_size)))
             chunk_count = 0
 
             while not stop_condition():
-                data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                data = stream.read(device_chunk_size, exception_on_overflow=False)
                 frames.append(data)
                 chunk_count += 1
 
@@ -450,6 +521,14 @@ class Jarvis:
             if not frames:
                 return None
 
+            # Combine frames
+            audio_data = b''.join(frames)
+            audio_np = np.frombuffer(audio_data, dtype=np.int16)
+
+            # Resample if needed
+            if self.needs_resampling:
+                audio_np = self._resample_audio(audio_np, self.device_sample_rate, SAMPLE_RATE)
+
             # Save to temp file
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
             temp_path = temp_file.name
@@ -459,7 +538,7 @@ class Jarvis:
             wf.setnchannels(CHANNELS)
             wf.setsampwidth(self.pyaudio.get_sample_size(pyaudio.paInt16))
             wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(b''.join(frames))
+            wf.writeframes(audio_np.tobytes())
             wf.close()
 
             return temp_path
@@ -468,15 +547,6 @@ class Jarvis:
             print(f"[ERROR] Recording failed: {e}")
             return None
 
-    def is_ctrl_pressed(self):
-        """Check if Ctrl key is pressed"""
-        try:
-            if os.path.exists(KEYBOARD_STATE_FILE):
-                with open(KEYBOARD_STATE_FILE, 'r') as f:
-                    return f.read().strip() == '1'
-        except:
-            pass
-        return False
 
     def check_trigger_file(self):
         """Check if trigger file was modified"""
@@ -543,34 +613,38 @@ class Jarvis:
     def audio_capture_thread(self):
         """Background thread for continuous audio capture"""
         try:
+            # Use device sample rate directly - NO numpy operations in this thread
+            # Any numpy operations cause segfaults in background thread
+            device_chunk_size = int(CHUNK_SIZE * self.device_sample_rate / SAMPLE_RATE)
+
             stream = self.pyaudio.open(
                 format=pyaudio.paInt16,
                 channels=CHANNELS,
-                rate=SAMPLE_RATE,
+                rate=self.device_sample_rate,
                 input=True,
-                frames_per_buffer=CHUNK_SIZE
+                frames_per_buffer=device_chunk_size
             )
-
-            print("[AUDIO] Capture thread started")
-            sys.stdout.flush()
 
             while self.streaming_mode and not self.shutdown:
                 try:
-                    # Read audio chunk
-                    audio_data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
-                    audio_np = np.frombuffer(audio_data, dtype=np.int16)
+                    # Read audio chunk - keep as raw bytes
+                    audio_data = stream.read(device_chunk_size, exception_on_overflow=False)
 
-                    # Add to streaming buffer
-                    self.streaming_buffer.add_chunk(audio_np)
+                    # Store raw bytes directly - no numpy operations
+                    # Conversion happens in main thread when processing
+                    self.streaming_buffer.buffer.put(audio_data)
 
+                except KeyboardInterrupt:
+                    break
                 except Exception as e:
                     print(f"[ERROR] Audio capture error: {e}", file=sys.stderr)
                     time.sleep(0.1)
 
             stream.stop_stream()
             stream.close()
-            print("[AUDIO] Capture thread stopped")
 
+        except KeyboardInterrupt:
+            pass
         except Exception as e:
             print(f"[ERROR] Audio thread failed: {e}")
             self.streaming_mode = False
@@ -592,37 +666,6 @@ class Jarvis:
                 self.audio_thread.join(timeout=1.0)
             self.streaming_buffer.clear()
 
-    def push_to_talk_mode(self):
-        """Push-to-talk: record while Ctrl is held"""
-        print("\n[PUSH-TO-TALK] Recording... (release Ctrl to stop)")
-        sys.stdout.flush()
-
-        audio_file = self.record_until_condition(
-            lambda: not self.is_ctrl_pressed()
-        )
-
-        if not audio_file:
-            print("[ERROR] Failed to record")
-            return
-
-        # Check if file has content
-        file_size = os.path.getsize(audio_file)
-        if file_size < 20000:
-            print("[SILENT] No speech detected")
-            os.unlink(audio_file)
-            return
-
-        # Transcribe
-        text = self.transcribe_audio(audio_file)
-        os.unlink(audio_file)
-
-        if text:
-            self.log_conversation(text)
-            print(f"\n[{datetime.now().strftime('%H:%M:%S')}]")
-            print(text)
-            sys.stdout.flush()
-
-            self.type_text(text)
 
     def typing_mode(self):
         """Typing mode: record fixed duration and type with countdown"""
@@ -660,115 +703,67 @@ class Jarvis:
             self.type_text(text)
 
     def continuous_logging(self):
-        """Main loop: continuous real-time streaming speech logging"""
-        print("\n[LISTENING] Real-time streaming transcription started")
-        print(f"[INFO] No gaps - continuous audio capture")
-        print(f"[INFO] To type mode: touch {TRIGGER_FILE}")
-        print("[INFO] Push-to-talk: Hold Ctrl key while speaking\n")
+        """Main loop: trigger file only for typing mode"""
+        print("[INFO] Create /tmp/jarvis-type-trigger for typing mode\n")
         sys.stdout.flush()
-
-        # Start background audio capture
-        self.start_streaming_capture()
-
-        # Accumulate chunks for processing
-        chunk_accumulator = []
-        chunks_per_frame = int(FRAME_LEN / CHUNK_DURATION_SEC)  # ~16 chunks per frame
 
         try:
             while not self.shutdown:
                 try:
-                    # Check for push-to-talk (Ctrl pressed)
-                    if self.is_ctrl_pressed():
-                        self.stop_streaming_capture()
-                        self.push_to_talk_mode()
-                        self.start_streaming_capture()
-                        chunk_accumulator = []
-                        continue
-
                     # Check for trigger file
                     if self.check_trigger_file():
-                        self.stop_streaming_capture()
                         print("\n[TRIGGER DETECTED] Switching to typing mode...")
                         sys.stdout.flush()
                         self.typing_mode()
-                        self.start_streaming_capture()
-                        chunk_accumulator = []
                         continue
 
-                    # Get next audio chunk from buffer
-                    chunk = self.streaming_buffer.get_chunk(timeout=0.1)
-
-                    if chunk is not None:
-                        chunk_accumulator.append(chunk)
-
-                        # Process when we have enough chunks
-                        if len(chunk_accumulator) >= chunks_per_frame:
-                            # Concatenate accumulated chunks
-                            frame = np.concatenate(chunk_accumulator)
-                            chunk_accumulator = []
-
-                            # Transcribe using sliding window
-                            text = self.frame_asr.transcribe_chunk(frame)
-
-                            if text and len(text) > 0:
-                                # Add to buffer
-                                self.transcription_buffer.add(text)
-
-                                # Log
-                                self.log_conversation(text)
-
-                                # Simple continuous output
-                                print(text, end=' ', flush=True)
-
-                                # Still run detection in background for logging
-                                self.check_ai_detection(text)
+                    # Just sleep and wait for user input
+                    time.sleep(0.1)
 
                 except Exception as e:
-                    print(f"[ERROR] Streaming error: {e}")
+                    print(f"[ERROR] Main loop error: {e}")
                     time.sleep(0.1)
 
         except KeyboardInterrupt:
             pass
-        finally:
-            self.stop_streaming_capture()
 
     def start(self):
         """Start Jarvis"""
-        print("\n╔════════════════════════════════════════════════════════════╗")
-        print("║         JARVIS - Continuous Speech Logger                  ║")
-        print("╚════════════════════════════════════════════════════════════╝")
+        print("\n╔══════════════════════════════════════════════╗")
+        print("║       JARVIS - Speech Logger                 ║")
+        print("╚══════════════════════════════════════════════╝")
+
+        # Show audio device info
+        if self.needs_resampling:
+            print(f"Audio: {self.device_sample_rate}Hz → 16kHz (resampling)")
+        else:
+            print(f"Audio: {self.device_sample_rate}Hz")
+
         sys.stdout.flush()
 
         # Clear log files on startup
         try:
             Path(LOG_FILE).write_text('')
-            print(f"[INIT] Cleared {LOG_FILE}")
-        except Exception as e:
-            print(f"[WARNING] Could not clear {LOG_FILE}: {e}")
-
-        try:
             Path("chat-revised.txt").write_text('')
-            print(f"[INIT] Cleared chat-revised.txt")
         except Exception as e:
-            print(f"[WARNING] Could not clear chat-revised.txt: {e}")
+            print(f"[WARNING] Could not clear log files: {e}")
 
         if not self.load_model():
             return False
 
         # Start keyboard listener
-        print("\n[INIT] Starting keyboard listener...")
-        sys.stdout.flush()
+        print("Starting keyboard listener...", end=' ', flush=True)
         try:
-            subprocess.Popen([sys.executable, "keyboard_listener.py"])
+            subprocess.Popen([sys.executable, "keyboard_listener.py"],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
             time.sleep(0.5)
-            print("[OK] Keyboard listener ready (Ctrl for push-to-talk)")
+            print("✓")
         except Exception as e:
-            print(f"[WARNING] Keyboard listener failed: {e}")
-            print("[INFO] Push-to-talk will not be available")
+            print(f"✗ (push-to-talk unavailable)")
 
         # Start conversation improver
-        print("\n[INIT] Starting conversation improver...")
-        sys.stdout.flush()
+        print("Starting conversation improver...", end=' ', flush=True)
         try:
             self.conversation_improver_process = subprocess.Popen(
                 [sys.executable, "conversation_improver.py"],
@@ -776,25 +771,22 @@ class Jarvis:
                 stderr=subprocess.DEVNULL
             )
             time.sleep(0.5)
-            print("[OK] Conversation improver ready (outputs to chat-revised.txt)")
+            print("✓")
         except Exception as e:
-            print(f"[WARNING] Conversation improver failed: {e}")
-            print("[INFO] Raw transcriptions will still be saved to chat.txt")
+            print(f"✗")
 
         # Initialize improved text cache
-        print("\n[INIT] Initializing improved text cache...")
-        sys.stdout.flush()
         if self.improved_log_path.exists():
             self.load_improved_entries()
-        print("[OK] Ready to show formatted transcriptions (raw + improved)")
 
+        print("\n[READY] Listening... (keyboard logger active)\n")
         sys.stdout.flush()
 
         # Start main loop
         try:
             self.continuous_logging()
         except KeyboardInterrupt:
-            print("\n[SHUTDOWN] Stopping...")
+            pass
         finally:
             self.cleanup()
 
@@ -922,11 +914,37 @@ class Jarvis:
             except:
                 pass
 
-        self.pyaudio.terminate()
-        print("[OK] Goodbye!")
+        # Cleanup keyboard controller (suppress pynput cleanup exception)
+        try:
+            del self.keyboard
+        except:
+            pass
+
+        # Terminate pyaudio safely
+        try:
+            if hasattr(self, 'pyaudio') and self.pyaudio:
+                self.pyaudio.terminate()
+        except:
+            pass
+
+        print("\n[STOPPED]")
         sys.stdout.flush()
 
 if __name__ == "__main__":
-    jarvis = Jarvis()
-    success = jarvis.start()
-    sys.exit(0 if success else 1)
+    import signal
+
+    # Suppress KeyboardInterrupt traceback
+    def signal_handler(sig, frame):
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+    try:
+        jarvis = Jarvis()
+        success = jarvis.start()
+        sys.exit(0 if success else 1)
+    except Exception as e:
+        # Suppress pynput Controller cleanup exceptions
+        if 'NoneType' not in str(e):
+            print(f"[ERROR] {e}", file=sys.stderr)
+        sys.exit(1)
