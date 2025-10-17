@@ -36,31 +36,39 @@ class AIDetector:
             self.config = yaml.safe_load(f)
 
         self.ai_name = self.config['ai_name']
+        self.ai_aliases = self.config.get('ai_aliases', [])
         self.threshold = self.config['detection']['threshold']
         self.verbose = self.config['detection'].get('verbose', False)
         self.use_model = self.config['model'].get('use_model', False)
 
-        # Compile regex patterns for command detection
-        name_pattern = re.escape(self.ai_name.lower())
+        # All names to check (main name + aliases)
+        self.all_names = [self.ai_name.lower()] + [alias.lower() for alias in self.ai_aliases]
 
-        # Patterns that indicate commanding/addressing
-        self.command_patterns = [
-            rf'\b{name_pattern}\s*,',  # "Jarvis, ..."
-            rf'^{name_pattern}\s+\w+',  # "Jarvis do..."
-            rf'\bhey\s+{name_pattern}\b',  # "hey Jarvis"
-            rf'\bok(?:ay)?\s+{name_pattern}\b',  # "okay Jarvis"
-            rf'{name_pattern}\s+(?:can|could|will|please)\b',  # "Jarvis can/could/will/please..."
-            rf'{name_pattern}\s+(?:would|could)\s+you\b',  # "Jarvis would you..." / "Jarvis could you..."
-        ]
+        # Compile regex patterns for command detection for all names
+        self.command_patterns = []
+        self.mention_patterns = []
 
-        # Patterns that indicate just mentioning
-        self.mention_patterns = [
-            rf'\b{name_pattern}\s+is\b',  # "Jarvis is..."
-            rf'\b{name_pattern}\s+would\s+(?!you)\w+',  # "Jarvis would like..." (but not "Jarvis would you")
-            rf'\bwas\s+\w+\s+{name_pattern}\b',  # "was talking to Jarvis"
-            rf'\btell\s+{name_pattern}\b',  # "tell Jarvis"
-            rf'\btalking\s+to\s+{name_pattern}\b',  # "talking to Jarvis"
-        ]
+        for name in self.all_names:
+            name_pattern = re.escape(name)
+
+            # Patterns that indicate commanding/addressing
+            self.command_patterns.extend([
+                rf'\b{name_pattern}\s*,',  # "Jarvis, ..."
+                rf'^{name_pattern}\s+\w+',  # "Jarvis do..."
+                rf'\bhey\s+{name_pattern}\b',  # "hey Jarvis"
+                rf'\bok(?:ay)?\s+{name_pattern}\b',  # "okay Jarvis"
+                rf'{name_pattern}\s+(?:can|could|will|please)\b',  # "Jarvis can/could/will/please..."
+                rf'{name_pattern}\s+(?:would|could)\s+you\b',  # "Jarvis would you..." / "Jarvis could you..."
+            ])
+
+            # Patterns that indicate just mentioning
+            self.mention_patterns.extend([
+                rf'\b{name_pattern}\s+is\b',  # "Jarvis is..."
+                rf'\b{name_pattern}\s+would\s+(?!you)\w+',  # "Jarvis would like..." (but not "Jarvis would you")
+                rf'\bwas\s+\w+\s+{name_pattern}\b',  # "was talking to Jarvis"
+                rf'\btell\s+{name_pattern}\b',  # "tell Jarvis"
+                rf'\btalking\s+to\s+{name_pattern}\b',  # "talking to Jarvis"
+            ])
 
         # Only load model if explicitly enabled
         self.classifier = None
@@ -127,13 +135,14 @@ class AIDetector:
 
         text_lower = analysis_text.lower()
 
-        # First check if AI name is mentioned at all
-        if self.ai_name.lower() not in text_lower:
+        # First check if AI name or any alias is mentioned at all
+        name_found = any(name in text_lower for name in self.all_names)
+        if not name_found:
             if self.verbose:
                 print(f"\nBuffer: {message[:100]}..." if len(message) > 100 else f"\nBuffer: {message}")
                 if use_sentences:
                     print(f"Analyzed text (last {n_sentences} sentences): {analysis_text}")
-                print(f"AI name '{self.ai_name}' not found in text")
+                print(f"AI name '{self.ai_name}' or aliases not found in text")
             return False
 
         # Rule-based detection

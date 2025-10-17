@@ -7,10 +7,11 @@ Continuous speech logging with push-to-talk and typing modes
 import os
 import sys
 import time
-import queue
-import threading
 import subprocess
 import tempfile
+import json
+import threading
+import queue
 from pathlib import Path
 from datetime import datetime
 from collections import deque
@@ -23,11 +24,11 @@ logging.getLogger().setLevel(logging.ERROR)
 os.environ['PYTHONWARNINGS'] = 'ignore'
 
 import torch
+import numpy as np
 import nemo.collections.asr as nemo_asr
 import pyaudio
 import wave
-import numpy as np
-from pynput.keyboard import Controller, Key
+from pynput.keyboard import Controller
 
 # Constants
 SAMPLE_RATE = 16000
@@ -35,38 +36,244 @@ CHUNK_SIZE = 1600  # 100ms chunks at 16kHz
 CHANNELS = 1
 TRIGGER_FILE = "/tmp/jarvis-type-trigger"
 KEYBOARD_STATE_FILE = "/tmp/jarvis-ctrl-state"
-LOG_FILE = "conversation.jsonl"
+LOG_FILE = "chat.txt"
+
+# Streaming ASR settings
+FRAME_LEN = 1.6  # seconds per frame
+CHUNK_DURATION_SEC = 0.1  # 100ms chunks
+SILENCE_THRESHOLD = 10  # Minimum audio energy to consider as speech (lower = more sensitive) - VERY SENSITIVE
+MIN_SPEECH_RATIO = 0.0001  # Minimum % of frame that must be above threshold (0.01%) - VERY SENSITIVE
+
+# Common hallucinations to filter out
+HALLUCINATION_PHRASES = {
+    'thank you', 'thanks for watching', 'please subscribe',
+    'you', 'uh', 'um', 'ah', 'mm', 'hmm',
+    '.', '...', 'okay', 'ok'
+}
+
+# Word corrections for common misrecognitions
+WORD_CORRECTIONS = {
+    'jarve': 'Jarvis',
+    'jarvy': 'Jarvis',
+    'jarry': 'Jarvis',
+    'jervis': 'Jarvis',
+    'jarvie': 'Jarvis',
+}
 
 # AI Detection
 AI_DETECTOR_SCRIPT = "ai-detector/ai_detector_cli.py"
 AI_DETECTOR_PYTHON = "ai-detector/venv/bin/python"
-DETECTION_COOLDOWN = 30  # seconds
+DETECTION_COOLDOWN = 5  # seconds
 BUFFER_DURATION = 300  # 5 minutes in seconds
 
-class AudioBuffer:
-    """Thread-safe audio buffer for streaming"""
-    def __init__(self):
+
+class StreamingAudioBuffer:
+    """Continuous audio buffer for real-time streaming"""
+    def __init__(self, sample_rate=SAMPLE_RATE):
+        self.sample_rate = sample_rate
         self.buffer = queue.Queue()
-        self.is_recording = False
+        self.is_active = False
 
-    def add(self, data):
-        self.buffer.put(data)
+    def add_chunk(self, audio_data):
+        """Add audio chunk to buffer"""
+        # Convert int16 to float32 [-1, 1]
+        audio_float = audio_data.astype(np.float32) / 32768.0
+        self.buffer.put(audio_float)
 
-    def get_all(self):
-        chunks = []
-        while not self.buffer.empty():
-            try:
-                chunks.append(self.buffer.get_nowait())
-            except queue.Empty:
-                break
-        return b''.join(chunks) if chunks else None
+    def get_chunk(self, timeout=0.1):
+        """Get next audio chunk"""
+        try:
+            return self.buffer.get(timeout=timeout)
+        except queue.Empty:
+            return None
 
     def clear(self):
+        """Clear the buffer"""
         while not self.buffer.empty():
             try:
                 self.buffer.get_nowait()
             except queue.Empty:
                 break
+
+
+class FrameASR:
+    """
+    Frame-based ASR for continuous streaming transcription
+    Uses overlapping buffers to prevent word cutoff
+    """
+    def __init__(self, model, frame_len=FRAME_LEN, sample_rate=SAMPLE_RATE):
+        self.model = model
+        self.frame_len = frame_len
+        self.sample_rate = sample_rate
+        self.n_frame_len = int(frame_len * sample_rate)
+
+        # Sliding buffer with overlap
+        self.buffer = np.zeros(self.n_frame_len, dtype=np.float32)
+        self.prev_text = ''
+        self.prev_text_count = 0  # Track how many times we see the same text
+        self.last_max_amplitude = 0
+        self.last_avg_amplitude = 0
+
+    def has_speech(self, audio, debug=False):
+        """
+        Check if audio contains speech using energy-based VAD
+        Returns: True if speech detected, False if silence
+        """
+        # Convert to int16 range for amplitude check
+        audio_int16 = (audio * 32768).astype(np.int16)
+
+        # Calculate absolute amplitude
+        amplitude = np.abs(audio_int16)
+
+        # Calculate max amplitude and average
+        max_amplitude = np.max(amplitude)
+        avg_amplitude = np.mean(amplitude)
+
+        # Check what percentage of samples exceed threshold
+        speech_samples = np.sum(amplitude > SILENCE_THRESHOLD)
+        speech_ratio = speech_samples / len(audio)
+
+        has_speech = speech_ratio > MIN_SPEECH_RATIO
+
+        # Store last values for logging
+        self.last_max_amplitude = max_amplitude
+        self.last_avg_amplitude = avg_amplitude
+
+        return has_speech
+
+    def transcribe_chunk(self, chunk):
+        """
+        Transcribe an audio chunk using the sliding buffer
+        Returns: transcribed text (only new characters)
+        """
+        if chunk is None or len(chunk) == 0:
+            return ""
+
+        # Update sliding buffer
+        chunk_len = len(chunk)
+        if chunk_len < self.n_frame_len:
+            # Shift buffer and add new chunk
+            self.buffer[:-chunk_len] = self.buffer[chunk_len:]
+            self.buffer[-chunk_len:] = chunk
+        else:
+            # Replace entire buffer
+            self.buffer = chunk[-self.n_frame_len:]
+
+        # Check if buffer contains speech (VAD) - enable debug
+        if not self.has_speech(self.buffer, debug=True):
+            # Reset counter on silence
+            if self.prev_text:
+                self.prev_text = ''
+                self.prev_text_count = 0
+            return ""
+
+        # Transcribe current buffer
+        start_time = time.time()
+        try:
+            # Create temp file for transcription
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+            temp_path = temp_file.name
+            temp_file.close()
+
+            # Write buffer to wav file
+            wf = wave.open(temp_path, 'wb')
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(self.sample_rate)
+            # Convert back to int16 for wav file
+            audio_int16 = (self.buffer * 32768).astype(np.int16)
+            wf.writeframes(audio_int16.tobytes())
+            wf.close()
+
+            # Transcribe
+            transcribe_start = time.time()
+            with torch.no_grad():
+                result = self.model.transcribe([temp_path], verbose=False)
+            transcribe_time = time.time() - transcribe_start
+
+            os.unlink(temp_path)
+
+            # Extract text
+            if isinstance(result, (list, tuple)) and len(result) > 0:
+                first = result[0]
+                if hasattr(first, 'text'):
+                    text = first.text
+                elif isinstance(first, str):
+                    text = first
+                else:
+                    text = str(first)
+            else:
+                text = str(result)
+
+            text = text.strip()
+
+            # Filter out empty or very short hallucinations
+            if len(text) < 2:
+                return ""
+
+            # Apply word corrections
+            text = self.apply_word_corrections(text)
+
+            # Filter common hallucination phrases
+            text_lower = text.lower()
+            if text_lower in HALLUCINATION_PHRASES:
+                return ""
+
+            # Deduplication: check if same as previous
+            if text == self.prev_text:
+                self.prev_text_count += 1
+                # If we see the same text 3+ times, it's likely a hallucination
+                if self.prev_text_count >= 3:
+                    return ""
+                # Otherwise skip duplicate
+                return ""
+
+            # New text detected
+            self.prev_text = text
+            self.prev_text_count = 1
+
+            return text
+
+        except Exception as e:
+            print(f"[ERROR] Chunk transcription failed: {e}", file=sys.stderr)
+            return ""
+
+    def apply_word_corrections(self, text):
+        """Apply word-level corrections for common misrecognitions"""
+        import re
+
+        # Split into words while preserving punctuation
+        words = text.split()
+        corrected_words = []
+
+        for word in words:
+            # Extract word without punctuation for matching
+            word_clean = re.sub(r'[^\w]', '', word).lower()
+
+            # Check if word needs correction
+            if word_clean in WORD_CORRECTIONS:
+                # Preserve original punctuation
+                punctuation = ''.join(c for c in word if not c.isalnum())
+                corrected = WORD_CORRECTIONS[word_clean]
+
+                # Reattach punctuation
+                if word[0] in '.,!?;:':
+                    corrected = word[0] + corrected
+                if len(word) > 1 and word[-1] in '.,!?;:':
+                    corrected = corrected + word[-1]
+
+                corrected_words.append(corrected)
+            else:
+                corrected_words.append(word)
+
+        return ' '.join(corrected_words)
+
+    def reset(self):
+        """Reset the buffer"""
+        self.buffer = np.zeros(self.n_frame_len, dtype=np.float32)
+        self.prev_text = ''
+        self.prev_text_count = 0
+
 
 class TranscriptionBuffer:
     """Rolling buffer for AI detection"""
@@ -95,20 +302,31 @@ class Jarvis:
         self.model = None
         self.pyaudio = pyaudio.PyAudio()
         self.keyboard = Controller()
-        self.audio_buffer = AudioBuffer()
         self.transcription_buffer = TranscriptionBuffer()
+        self.streaming_buffer = StreamingAudioBuffer()
+        self.frame_asr = None
+        self.audio_thread = None
         self.last_trigger_time = 0
         self.last_detection_time = 0
         self.shutdown = False
+        self.streaming_mode = False
+        self.conversation_improver_process = None
+
+        # Improved text cache
+        self.improved_cache = deque(maxlen=100)
+        self.improved_log_path = Path("chat-revised.txt")
+        self.improved_last_position = 0
 
     def load_model(self):
-        """Load NeMo ASR model"""
-        print("\n[INIT] Loading NeMo Parakeet-TDT-1.1B model...")
+        """Load NeMo ASR model with word boosting"""
+        print("\n[INIT] Loading NeMo Parakeet-TDT-0.6B-v3 model...")
+        print("[INFO] Supports: English + Hungarian + 23 other EU languages")
+        print("[INFO] Word corrections enabled for: Jarvis")
         sys.stdout.flush()
 
         try:
             self.model = nemo_asr.models.ASRModel.from_pretrained(
-                "nvidia/parakeet-tdt-1.1b"
+                "nvidia/parakeet-tdt-0.6b-v3"
             )
 
             if torch.cuda.is_available():
@@ -122,6 +340,11 @@ class Jarvis:
 
             self.model.eval()
             print("[OK] NeMo model ready!")
+
+            # Initialize frame-based ASR for streaming
+            self.frame_asr = FrameASR(self.model)
+            print("[OK] Streaming ASR initialized!")
+
             sys.stdout.flush()
             return True
 
@@ -148,7 +371,12 @@ class Jarvis:
             else:
                 text = str(result)
 
-            return text.strip()
+            text = text.strip()
+
+            # Apply word corrections
+            text = self.frame_asr.apply_word_corrections(text) if self.frame_asr else text
+
+            return text
         except Exception as e:
             print(f"[ERROR] Transcription failed: {e}")
             return None
@@ -271,45 +499,98 @@ class Jarvis:
         except Exception as e:
             print(f"[ERROR] Typing failed: {e}")
 
-    def log_conversation(self, text, speaker="user"):
-        """Log conversation to JSONL file"""
+    def log_conversation(self, text):
+        """Log conversation as continuous text"""
         try:
-            import json
-            entry = {
-                'timestamp': datetime.now().isoformat(),
-                'speaker': speaker,
-                'text': text
-            }
             with open(LOG_FILE, 'a') as f:
-                f.write(json.dumps(entry) + '\n')
+                f.write(text + ' ')
         except Exception as e:
             print(f"[ERROR] Logging failed: {e}")
 
-    def check_ai_detection(self):
-        """Check if text is directed at AI"""
+    def check_ai_detection(self, text):
+        """
+        Check if text is directed at AI.
+        Returns: (should_display, is_ai_detected) tuple
+        """
         now = time.time()
-        if now - self.last_detection_time < DETECTION_COOLDOWN:
-            return False
 
-        text = self.transcription_buffer.get_text()
-        if not text:
-            return False
+        # Don't check too frequently (cooldown)
+        if now - self.last_detection_time < DETECTION_COOLDOWN:
+            return (False, False)
+
+        # Need at least some text in buffer
+        buffer_text = self.transcription_buffer.get_text()
+        if not buffer_text:
+            return (False, False)
 
         try:
             result = subprocess.run(
-                [AI_DETECTOR_PYTHON, AI_DETECTOR_SCRIPT, text],
+                [AI_DETECTOR_PYTHON, AI_DETECTOR_SCRIPT, buffer_text],
                 capture_output=True,
-                timeout=5
+                timeout=5,
+                text=True
             )
 
-            if result.returncode == 0:
-                self.last_detection_time = now
-                return True
+            self.last_detection_time = now
+            is_ai_detected = (result.returncode == 0)
+
+            return (True, is_ai_detected)
 
         except Exception as e:
-            print(f"[ERROR] AI detection failed: {e}")
+            print(f"[ERROR] AI detection failed: {e}", file=sys.stderr)
+            return (False, False)
 
-        return False
+    def audio_capture_thread(self):
+        """Background thread for continuous audio capture"""
+        try:
+            stream = self.pyaudio.open(
+                format=pyaudio.paInt16,
+                channels=CHANNELS,
+                rate=SAMPLE_RATE,
+                input=True,
+                frames_per_buffer=CHUNK_SIZE
+            )
+
+            print("[AUDIO] Capture thread started")
+            sys.stdout.flush()
+
+            while self.streaming_mode and not self.shutdown:
+                try:
+                    # Read audio chunk
+                    audio_data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                    audio_np = np.frombuffer(audio_data, dtype=np.int16)
+
+                    # Add to streaming buffer
+                    self.streaming_buffer.add_chunk(audio_np)
+
+                except Exception as e:
+                    print(f"[ERROR] Audio capture error: {e}", file=sys.stderr)
+                    time.sleep(0.1)
+
+            stream.stop_stream()
+            stream.close()
+            print("[AUDIO] Capture thread stopped")
+
+        except Exception as e:
+            print(f"[ERROR] Audio thread failed: {e}")
+            self.streaming_mode = False
+
+    def start_streaming_capture(self):
+        """Start background audio capture"""
+        if not self.streaming_mode:
+            self.streaming_mode = True
+            self.streaming_buffer.clear()
+            self.audio_thread = threading.Thread(target=self.audio_capture_thread, daemon=True)
+            self.audio_thread.start()
+            time.sleep(0.2)  # Let thread initialize
+
+    def stop_streaming_capture(self):
+        """Stop background audio capture"""
+        if self.streaming_mode:
+            self.streaming_mode = False
+            if self.audio_thread:
+                self.audio_thread.join(timeout=1.0)
+            self.streaming_buffer.clear()
 
     def push_to_talk_mode(self):
         """Push-to-talk: record while Ctrl is held"""
@@ -379,63 +660,77 @@ class Jarvis:
             self.type_text(text)
 
     def continuous_logging(self):
-        """Main loop: continuous speech logging"""
-        print("\n[LISTENING] Continuous speech-to-text logging started")
-        print(f"[INFO] Speaking now - everything will be logged")
+        """Main loop: continuous real-time streaming speech logging"""
+        print("\n[LISTENING] Real-time streaming transcription started")
+        print(f"[INFO] No gaps - continuous audio capture")
         print(f"[INFO] To type mode: touch {TRIGGER_FILE}")
         print("[INFO] Push-to-talk: Hold Ctrl key while speaking\n")
         sys.stdout.flush()
 
-        while not self.shutdown:
-            try:
-                # Check for push-to-talk (Ctrl pressed)
-                if self.is_ctrl_pressed():
-                    self.push_to_talk_mode()
-                    continue
+        # Start background audio capture
+        self.start_streaming_capture()
 
-                # Check for trigger file
-                if self.check_trigger_file():
-                    print("\n[TRIGGER DETECTED] Switching to typing mode...")
-                    sys.stdout.flush()
-                    self.typing_mode()
-                    continue
+        # Accumulate chunks for processing
+        chunk_accumulator = []
+        chunks_per_frame = int(FRAME_LEN / CHUNK_DURATION_SEC)  # ~16 chunks per frame
 
-                # Record and transcribe 2-second chunk
-                start_time = time.time()
-                audio_file = self.record_audio_chunk(duration_ms=2000)
-                record_time = time.time()
+        try:
+            while not self.shutdown:
+                try:
+                    # Check for push-to-talk (Ctrl pressed)
+                    if self.is_ctrl_pressed():
+                        self.stop_streaming_capture()
+                        self.push_to_talk_mode()
+                        self.start_streaming_capture()
+                        chunk_accumulator = []
+                        continue
 
-                if not audio_file:
-                    continue
+                    # Check for trigger file
+                    if self.check_trigger_file():
+                        self.stop_streaming_capture()
+                        print("\n[TRIGGER DETECTED] Switching to typing mode...")
+                        sys.stdout.flush()
+                        self.typing_mode()
+                        self.start_streaming_capture()
+                        chunk_accumulator = []
+                        continue
 
-                # Check if file has content
-                file_size = os.path.getsize(audio_file)
-                if file_size < 20000:
-                    os.unlink(audio_file)
-                    continue
+                    # Get next audio chunk from buffer
+                    chunk = self.streaming_buffer.get_chunk(timeout=0.1)
 
-                # Transcribe
-                text = self.transcribe_audio(audio_file)
-                transcribe_time = time.time()
-                os.unlink(audio_file)
+                    if chunk is not None:
+                        chunk_accumulator.append(chunk)
 
-                if text:
-                    # Add to buffer
-                    self.transcription_buffer.add(text)
+                        # Process when we have enough chunks
+                        if len(chunk_accumulator) >= chunks_per_frame:
+                            # Concatenate accumulated chunks
+                            frame = np.concatenate(chunk_accumulator)
+                            chunk_accumulator = []
 
-                    # Log
-                    self.log_conversation(text)
+                            # Transcribe using sliding window
+                            text = self.frame_asr.transcribe_chunk(frame)
 
-                    # Print timestamp and text
-                    print(f"\n[{datetime.now().strftime('%H:%M:%S')}]")
-                    print(text)
-                    sys.stdout.flush()
+                            if text and len(text) > 0:
+                                # Add to buffer
+                                self.transcription_buffer.add(text)
 
-            except KeyboardInterrupt:
-                break
-            except Exception as e:
-                print(f"[ERROR] Loop error: {e}")
-                time.sleep(0.5)
+                                # Log
+                                self.log_conversation(text)
+
+                                # Simple continuous output
+                                print(text, end=' ', flush=True)
+
+                                # Still run detection in background for logging
+                                self.check_ai_detection(text)
+
+                except Exception as e:
+                    print(f"[ERROR] Streaming error: {e}")
+                    time.sleep(0.1)
+
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.stop_streaming_capture()
 
     def start(self):
         """Start Jarvis"""
@@ -443,6 +738,19 @@ class Jarvis:
         print("║         JARVIS - Continuous Speech Logger                  ║")
         print("╚════════════════════════════════════════════════════════════╝")
         sys.stdout.flush()
+
+        # Clear log files on startup
+        try:
+            Path(LOG_FILE).write_text('')
+            print(f"[INIT] Cleared {LOG_FILE}")
+        except Exception as e:
+            print(f"[WARNING] Could not clear {LOG_FILE}: {e}")
+
+        try:
+            Path("chat-revised.txt").write_text('')
+            print(f"[INIT] Cleared chat-revised.txt")
+        except Exception as e:
+            print(f"[WARNING] Could not clear chat-revised.txt: {e}")
 
         if not self.load_model():
             return False
@@ -458,6 +766,28 @@ class Jarvis:
             print(f"[WARNING] Keyboard listener failed: {e}")
             print("[INFO] Push-to-talk will not be available")
 
+        # Start conversation improver
+        print("\n[INIT] Starting conversation improver...")
+        sys.stdout.flush()
+        try:
+            self.conversation_improver_process = subprocess.Popen(
+                [sys.executable, "conversation_improver.py"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            time.sleep(0.5)
+            print("[OK] Conversation improver ready (outputs to chat-revised.txt)")
+        except Exception as e:
+            print(f"[WARNING] Conversation improver failed: {e}")
+            print("[INFO] Raw transcriptions will still be saved to chat.txt")
+
+        # Initialize improved text cache
+        print("\n[INIT] Initializing improved text cache...")
+        sys.stdout.flush()
+        if self.improved_log_path.exists():
+            self.load_improved_entries()
+        print("[OK] Ready to show formatted transcriptions (raw + improved)")
+
         sys.stdout.flush()
 
         # Start main loop
@@ -470,9 +800,128 @@ class Jarvis:
 
         return True
 
+    def load_improved_entries(self):
+        """Load new improved text entries from conversation_improved.json"""
+        if not self.improved_log_path.exists():
+            return
+
+        try:
+            with open(self.improved_log_path, 'r') as f:
+                f.seek(self.improved_last_position)
+                new_content = f.read()
+                self.improved_last_position = f.tell()
+
+            if not new_content.strip():
+                return
+
+            # Parse new improved entries
+            for line in new_content.strip().split('\n'):
+                if line.strip():
+                    try:
+                        entry = json.loads(line)
+                        self.improved_cache.append(entry)
+                    except json.JSONDecodeError:
+                        pass
+
+        except Exception:
+            pass  # Silent fail
+
+    def find_improved_text(self, raw_text: str, timestamp: str = None) -> dict:
+        """Find the best matching improved text for a raw message"""
+        from difflib import SequenceMatcher
+
+        # Load any new entries first
+        self.load_improved_entries()
+
+        if not self.improved_cache:
+            return None
+
+        # Try to match by timestamp if provided
+        if timestamp:
+            for entry in self.improved_cache:
+                timestamp_start = entry.get('timestamp_start', '')
+                timestamp_end = entry.get('timestamp_end', '')
+
+                if timestamp_start <= timestamp <= timestamp_end:
+                    return {
+                        'improved_text': entry.get('improved_text'),
+                        'original_batch': entry.get('original_text')
+                    }
+
+        # Try substring match
+        best_match = None
+        best_score = 0.0
+
+        for entry in self.improved_cache:
+            original = entry.get('original_text', '')
+
+            # Check if raw text is a substring
+            if raw_text.lower().strip() in original.lower():
+                return {
+                    'improved_text': entry.get('improved_text'),
+                    'original_batch': original
+                }
+
+            # Calculate similarity as fallback
+            similarity = SequenceMatcher(None, raw_text.lower(), original.lower()).ratio()
+
+            if similarity > best_score:
+                best_score = similarity
+                best_match = entry
+
+        # Return if similarity is reasonable (>30%)
+        if best_score > 0.3 and best_match:
+            return {
+                'improved_text': best_match.get('improved_text'),
+                'original_batch': best_match.get('original_text')
+            }
+
+        return None
+
+    def display_formatted_output(self, text: str, is_ai_detected: bool, timestamp: str = None):
+        """Display formatted output with raw and improved text"""
+        # Find improved text
+        improved_data = self.find_improved_text(text, timestamp)
+
+        # Print AI detection status
+        if is_ai_detected:
+            print("Ai: me", flush=True)
+        else:
+            print("Ai: not me", flush=True)
+
+        # Always show raw text
+        print(f"  Raw: {text}", flush=True)
+
+        # Show batch context if available
+        if improved_data:
+            original_batch = improved_data.get('original_batch')
+            if original_batch:
+                # Truncate if too long (show first 150 chars)
+                batch_display = original_batch if len(original_batch) <= 150 else original_batch[:150] + "..."
+                print(f"  Batch: {batch_display}", flush=True)
+
+            # Show improved text
+            improved_text = improved_data.get('improved_text')
+            if improved_text:
+                print(f"  Improved: {improved_text}", flush=True)
+            else:
+                print(f"  Improved: (not available yet)", flush=True)
+        else:
+            print(f"  Improved: (not available yet)", flush=True)
+
     def cleanup(self):
         """Cleanup resources"""
         self.shutdown = True
+        self.stop_streaming_capture()
+
+        # Stop conversation improver
+        if self.conversation_improver_process:
+            try:
+                self.conversation_improver_process.terminate()
+                self.conversation_improver_process.wait(timeout=2)
+            except:
+                pass
+
         self.pyaudio.terminate()
         print("[OK] Goodbye!")
         sys.stdout.flush()

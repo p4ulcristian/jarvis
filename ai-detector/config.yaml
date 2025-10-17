@@ -3,8 +3,15 @@
 # Name of your AI assistant
 ai_name: "Jarvis"
 
+# Phonetic aliases (for when ASR misrecognizes the name)
+# Add variations that your speech model transcribes incorrectly
+ai_aliases:
+  - "john wis"
+  - "job is"
+  - "john miss"
+
 # Path to conversation log file (JSONL format)
-log_file: "/home/paul/Work/jarvis/ai-detector/conversation.jsonl"
+log_file: "/home/paul/Work/jarvis/conversation.json"
 
 # Model settings
 model:
