@@ -1,6 +1,7 @@
 # Clojure
 .cpcache/
 .lsp/
+.clj-kondo/
 *.jar
 target/
 
