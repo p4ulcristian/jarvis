@@ -10,11 +10,35 @@ from datetime import datetime
 from typing import Optional
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
-from textual.widgets import Static, RichLog, ProgressBar, Header, Footer
+from textual.widgets import Static, RichLog, ProgressBar, Header, Footer, Button
 from textual.reactive import reactive
 from rich.text import Text
+import subprocess
 
 from .data_bridge import DataBridge
+
+
+class ToggleButton(Button):
+    """Button widget that can be toggled on/off with different colors"""
+
+    is_active = reactive(False)
+
+    def __init__(self, label: str, *args, **kwargs):
+        super().__init__(label, *args, **kwargs)
+
+    def toggle(self) -> None:
+        """Toggle the button state"""
+        self.is_active = not self.is_active
+        self.update_classes()
+
+    def update_classes(self) -> None:
+        """Update CSS classes based on state"""
+        if self.is_active:
+            self.add_class("active")
+            self.remove_class("passive")
+        else:
+            self.add_class("passive")
+            self.remove_class("active")
 
 
 class MicMonitor(Static):
@@ -92,15 +116,57 @@ class JarvisApp(App):
         background: #1a1a2e;
     }
 
-    #title {
+    #header {
         column-span: 5;
+        height: 3;
+        layout: horizontal;
+        background: #2d2d44;
+        border: round #b8b8ff;
+    }
+
+    #title {
+        width: 1fr;
         content-align: center middle;
         text-style: bold;
         color: #b8b8ff;
         background: #2d2d44;
-        border: round #b8b8ff;
-        height: 3;
         text-align: center;
+    }
+
+    #button-bar {
+        width: auto;
+        height: 100%;
+        align: right middle;
+        padding: 0 2;
+    }
+
+    ToggleButton {
+        margin: 0 1;
+        min-width: 15;
+        height: 1;
+    }
+
+    ToggleButton.passive {
+        background: #3d3d54;
+        color: #7888a0;
+        border: none;
+    }
+
+    ToggleButton.passive:hover {
+        background: #4d4d64;
+        color: #8898b0;
+    }
+
+    ToggleButton.active {
+        background: #99ddbb;
+        color: #1a1a2e;
+        text-style: bold;
+        border: none;
+    }
+
+    ToggleButton.active:hover {
+        background: #aaeedd;
+        color: #1a1a2e;
     }
 
     #transcription {
@@ -154,9 +220,17 @@ class JarvisApp(App):
 
     def compose(self) -> ComposeResult:
         """Create child widgets"""
-        # Fancy ASCII art title
-        title_text = "✨ J · A · R · V · I · S ✨"
-        yield Static(title_text, id="title")
+        # Header with title and buttons
+        with Container(id="header"):
+            yield Static("✨ J · A · R · V · I · S ✨", id="title")
+            with Horizontal(id="button-bar"):
+                type_btn = ToggleButton("Type Mode", id="type-mode-btn")
+                type_btn.add_class("passive")
+                yield type_btn
+
+                chat_btn = ToggleButton("Chat Mode", id="chat-mode-btn")
+                chat_btn.add_class("passive")
+                yield chat_btn
 
         # Transcription log (scrollable)
         transcription_log = RichLog(
@@ -194,6 +268,27 @@ class JarvisApp(App):
 
         sys_log = self.query_one("#logs", RichLog)
         sys_log.write("[#99ccff]⚡ System initialized[/#99ccff]")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Handle button presses"""
+        button = event.button
+
+        if isinstance(button, ToggleButton):
+            button.toggle()
+
+            say_script = "/home/paul/Work/jarvis/source-code/services/say.sh"
+
+            if button.id == "type-mode-btn":
+                if button.is_active:
+                    subprocess.Popen([say_script, "type mode enabled"])
+                else:
+                    subprocess.Popen([say_script, "type mode disabled"])
+
+            elif button.id == "chat-mode-btn":
+                if button.is_active:
+                    subprocess.Popen([say_script, "chat mode enabled"])
+                else:
+                    subprocess.Popen([say_script, "chat mode disabled"])
 
     def update_data(self) -> None:
         """Update UI from data bridge (called periodically)"""
