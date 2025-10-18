@@ -279,10 +279,15 @@ class JarvisApp(App):
             say_script = "/home/paul/Work/jarvis/source-code/services/say.sh"
 
             if button.id == "type-mode-btn":
+                # Update state in data bridge
+                self.data_bridge.update_state(type_mode=button.is_active)
+
                 if button.is_active:
                     subprocess.Popen([say_script, "type mode enabled"])
+                    self.data_bridge.send_log("INFO", "Type Mode: ON - Transcriptions will be typed automatically")
                 else:
                     subprocess.Popen([say_script, "type mode disabled"])
+                    self.data_bridge.send_log("INFO", "Type Mode: OFF")
 
             elif button.id == "chat-mode-btn":
                 if button.is_active:

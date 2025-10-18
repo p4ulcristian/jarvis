@@ -10,7 +10,13 @@ FEELING="${2:-}"
 TEMP_FILE="/tmp/say_$(date +%s%N).mp3"
 
 # Use jq to properly escape JSON (handles quotes, newlines, special chars)
-JSON_PAYLOAD=$(jq -n --arg text "$TEXT" '{model: "tts-1", input: $text, voice: "nova"}')
+# If feeling is provided, prepend it to the text for expressive delivery
+if [ -n "$FEELING" ]; then
+  EXPRESSIVE_TEXT="[${FEELING}] ${TEXT}"
+  JSON_PAYLOAD=$(jq -n --arg text "$EXPRESSIVE_TEXT" '{model: "tts-1", input: $text, voice: "nova"}')
+else
+  JSON_PAYLOAD=$(jq -n --arg text "$TEXT" '{model: "tts-1", input: $text, voice: "nova"}')
+fi
 
 curl -s -X POST https://api.openai.com/v1/audio/speech \
   -H "Authorization: Bearer $OPENAI_API_KEY" \

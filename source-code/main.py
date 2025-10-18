@@ -44,6 +44,7 @@ class Jarvis:
         self.frame_asr = None
         self.audio_capture = None
         self.transcription_buffer = RollingBuffer(max_duration=config.buffer_duration)
+        self.keyboard_typer = None
 
         # State
         self.shutdown = False
@@ -205,6 +206,16 @@ class Jarvis:
                                 if self.data_bridge:
                                     self.data_bridge.send_transcription(text)
 
+                                # Check if Type Mode is active and type the text
+                                if self.data_bridge and self.keyboard_typer:
+                                    state = self.data_bridge.get_state()
+                                    if state.type_mode:
+                                        try:
+                                            self.keyboard_typer.type_text(text)
+                                            self.logger.debug(f"Typed: {text}")
+                                        except Exception as e:
+                                            self.logger.error(f"Failed to type text: {e}")
+
                                 # Display (only if no UI)
                                 if not self.config.enable_ui:
                                     timestamp = datetime.now().strftime('%H:%M:%S')
@@ -243,6 +254,20 @@ class Jarvis:
         except Exception as e:
             self.logger.warning(f"Could not clear log files: {e}")
 
+        # Initialize keyboard typer
+        try:
+            from services.keyboard_typer import get_typer
+            self.keyboard_typer = get_typer(typing_delay=0.01)
+            # Pre-initialize to check permissions
+            if self.keyboard_typer.initialize():
+                self.logger.info("Keyboard typer initialized successfully")
+            else:
+                self.logger.warning("Keyboard typer initialization failed - Type Mode will not work")
+                if self.data_bridge:
+                    self.data_bridge.send_log("WARNING", "Keyboard typer failed - check permissions")
+        except Exception as e:
+            self.logger.warning(f"Could not initialize keyboard typer: {e}")
+
         # Load model (this is slow - UI should already be running)
         if not self.load_model():
             self.logger.error("Failed to load model")
@@ -269,6 +294,10 @@ class Jarvis:
         """Cleanup resources"""
         self.shutdown = True
         self.logger.info("Shutting down...")
+
+        # Clean up keyboard typer
+        if self.keyboard_typer:
+            self.keyboard_typer.cleanup()
 
 
 # Global references for cleanup

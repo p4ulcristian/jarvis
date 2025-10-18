@@ -350,9 +350,7 @@ def _configure_word_boosting(model, boost_file: Path) -> None:
         from omegaconf import OmegaConf
         decoding_cfg = OmegaConf.create({
             'strategy': 'greedy_batch',
-            'context_score': 1.0,
-            'depth_scaling': 1.0,
-            'boosting_tree_alpha': 0.3,
+            'context_score': 3.0,
             'key_phrases_list': key_phrases
         })
 

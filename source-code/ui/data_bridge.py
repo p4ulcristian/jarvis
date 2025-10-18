@@ -39,6 +39,7 @@ class SystemState:
     model_loaded: bool
     mic_active: bool
     processing: bool
+    type_mode: bool
     error: Optional[str]
 
 
@@ -66,6 +67,7 @@ class DataBridge:
             model_loaded=False,
             mic_active=False,
             processing=False,
+            type_mode=False,
             error=None
         )
 
@@ -175,7 +177,7 @@ class DataBridge:
         Update system state
 
         Args:
-            **kwargs: State fields to update (model_loaded, mic_active, processing, error)
+            **kwargs: State fields to update (model_loaded, mic_active, processing, type_mode, error)
         """
         with self._state_lock:
             for key, value in kwargs.items():
@@ -194,6 +196,7 @@ class DataBridge:
                 model_loaded=self._state.model_loaded,
                 mic_active=self._state.mic_active,
                 processing=self._state.processing,
+                type_mode=self._state.type_mode,
                 error=self._state.error
             )
 
