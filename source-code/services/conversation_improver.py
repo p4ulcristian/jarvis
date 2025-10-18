@@ -15,8 +15,8 @@ import requests
 
 
 # Configuration
-INPUT_LOG = "chat.txt"
-OUTPUT_LOG = "chat-revised.txt"
+INPUT_LOG = "../data/chat.txt"
+OUTPUT_LOG = "../data/chat-revised.txt"
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "qwen2.5:3b-instruct"  # Qwen2.5 3B for better instruction following
 BATCH_DURATION = 10  # Process every 10 seconds

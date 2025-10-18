@@ -47,11 +47,11 @@ class Config:
         self.frame_len = self._get_float('FRAME_LEN', 1.6)
 
         # Paths
-        self.log_file = self._get_str('LOG_FILE', 'chat.txt')
-        self.improved_log_file = self._get_str('IMPROVED_LOG_FILE', 'chat-revised.txt')
+        self.log_file = self._get_str('LOG_FILE', 'data/chat.txt')
+        self.improved_log_file = self._get_str('IMPROVED_LOG_FILE', 'data/chat-revised.txt')
         self.trigger_file = self._get_str('TRIGGER_FILE', '/tmp/jarvis-type-trigger')
         self.keyboard_event_file = self._get_str('KEYBOARD_EVENT_FILE', '/tmp/jarvis-keyboard-events')
-        self.boost_words_file = self._get_str('BOOST_WORDS_FILE', 'boost_words.txt')
+        self.boost_words_file = self._get_str('BOOST_WORDS_FILE', 'config/boost_words.txt')
 
         # AI Detection
         self.detection_cooldown = self._get_int('DETECTION_COOLDOWN', 5)
