@@ -25,6 +25,7 @@ requests==2.32.3
 
 # Terminal UI
 rich==13.0.0
+textual>=0.89.0
 
 # Logging & Monitoring (optional)
 prometheus-client==0.21.0

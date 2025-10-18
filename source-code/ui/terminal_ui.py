@@ -1,68 +1,205 @@
 #!/usr/bin/env python3
 """
 JARVIS Terminal UI
-Production-ready dashboard-style terminal interface
+Interactive dashboard using Textual framework with scrollable elements
+Soft pastel color theme - easy on the eyes
 """
 
-import time
-import threading
+import asyncio
 from datetime import datetime
-from typing import Optional, List
-from rich.console import Console, Group
-from rich.layout import Layout
-from rich.panel import Panel
-from rich.live import Live
+from typing import Optional
+from textual.app import App, ComposeResult
+from textual.containers import Container, Horizontal, Vertical
+from textual.widgets import Static, RichLog, ProgressBar, Header, Footer
+from textual.reactive import reactive
 from rich.text import Text
-from rich.console import RenderableType
 
-from .data_bridge import DataBridge, SystemLog
+from .data_bridge import DataBridge
 
 
-class JarvisUI:
+class MicMonitor(Static):
+    """Widget to display microphone activity level"""
+
+    level = reactive(0.0)
+    peak = reactive(0.0)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.border_title = "Microphone"
+
+    def render(self) -> Text:
+        """Render the mic level display with soft pastel colors"""
+        level = self.level
+
+        # Create visual bar with smooth gradient effect
+        bar_length = 40
+        filled = int((level / 100) * bar_length)
+
+        # Use different characters for smoother visual
+        bar_chars = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+        filled_bar = "".join([bar_chars[min(7, int((i / bar_length) * 8))] for i in range(filled)])
+        empty_bar = "░" * (bar_length - filled)
+        bar = filled_bar + empty_bar
+
+        # Soft pastel colors based on level
+        if level > 70:
+            color = "#ff9999"  # pastel red
+            status_text = "LOUD"
+            status_color = "#ff9999"
+            icon = "🔊"
+        elif level > 40:
+            color = "#ffcc99"  # pastel orange
+            status_text = "ACTIVE"
+            status_color = "#ffcc99"
+            icon = "🎤"
+        elif level > 10:
+            color = "#99ff99"  # pastel green
+            status_text = "SPEAKING"
+            status_color = "#99ff99"
+            icon = "💬"
+        else:
+            color = "#ccccdd"  # soft gray
+            status_text = "QUIET"
+            status_color = "#9999cc"
+            icon = "🔇"
+
+        content = Text()
+        content.append(f"{icon} ", style="")
+        content.append(bar, style=color)
+        content.append("\n\n")
+        content.append(f"Level: ", style="#b8b8d0")
+        content.append(f"{level:.0f}%", style=color)
+        content.append(f"  │  ", style="#b8b8d0")
+        content.append(f"Peak: ", style="#b8b8d0")
+        content.append(f"{self.peak:.0f}%", style="#ccccdd")
+        content.append(f"\n\n")
+        content.append(f"{status_text}", style=status_color)
+
+        return content
+
+
+class JarvisApp(App):
+    """Textual App for JARVIS Dashboard"""
+
+    # Enable Ctrl+C to quit
+    BINDINGS = [("ctrl+c", "quit", "Quit")]
+
+    CSS = """
+    Screen {
+        layout: grid;
+        grid-size: 5 4;
+        grid-rows: 3 1fr 1fr 1;
+        background: #1a1a2e;
+    }
+
+    #title {
+        column-span: 5;
+        content-align: center middle;
+        text-style: bold;
+        color: #b8b8ff;
+        background: #2d2d44;
+        border: round #b8b8ff;
+        height: 3;
+        text-align: center;
+    }
+
+    #transcription {
+        column-span: 4;
+        border: round #99ddbb;
+        background: #1e1e2e;
+        height: 100%;
+    }
+
+    #mic {
+        column-span: 1;
+        border: round #ddaadd;
+        background: #1e1e2e;
+        height: 100%;
+        padding: 1 2;
+    }
+
+    #logs {
+        column-span: 5;
+        border: round #99ccff;
+        background: #1e1e2e;
+        height: 100%;
+    }
+
+    Footer {
+        column-span: 5;
+        background: #2d2d44;
+        color: #b8b8d0;
+    }
+
+    RichLog {
+        scrollbar-gutter: stable;
+        scrollbar-background: #2d2d44;
+        scrollbar-color: #b8b8ff;
+    }
     """
-    Terminal UI for JARVIS
-    Displays real-time audio levels, transcriptions, and system logs
-    """
 
-    def __init__(self, data_bridge: DataBridge, refresh_rate: int = 4, log_history: int = 50):
+    def __init__(self, data_bridge: DataBridge, refresh_rate: int = 4):
         """
-        Initialize JARVIS UI
+        Initialize JARVIS App
 
         Args:
             data_bridge: DataBridge instance for receiving data
             refresh_rate: UI refresh rate in Hz
-            log_history: Number of log entries to keep
         """
-        self.console = Console()
+        super().__init__()
         self.data_bridge = data_bridge
         self.refresh_rate = refresh_rate
-        self.log_history = log_history
+        self.transcription_count = 0
+        self.log_count = 0
 
-        # State
-        self.logs: List[str] = []
-        self.transcriptions: List[str] = []
-        self.current_mic_level: float = 0.0
-        self.peak_mic_level: float = 0.0
-        self.running = False
-        self.thread: Optional[threading.Thread] = None
+    def compose(self) -> ComposeResult:
+        """Create child widgets"""
+        # Fancy ASCII art title
+        title_text = "✨ J · A · R · V · I · S ✨"
+        yield Static(title_text, id="title")
 
-    def start(self) -> None:
-        """Start UI in background thread"""
-        if self.running:
-            return
+        # Transcription log (scrollable)
+        transcription_log = RichLog(
+            highlight=True,
+            markup=True,
+            id="transcription"
+        )
+        transcription_log.border_title = "💬 Transcription"
+        transcription_log.border_subtitle = "scroll: ↑↓ pgup/pgdn"
+        yield transcription_log
 
-        self.running = True
-        self.thread = threading.Thread(target=self._run_ui, daemon=True)
-        self.thread.start()
+        # Mic monitor
+        yield MicMonitor(id="mic")
 
-    def stop(self) -> None:
-        """Stop UI"""
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=1.0)
+        # System logs (scrollable)
+        system_log = RichLog(
+            highlight=True,
+            markup=True,
+            id="logs"
+        )
+        system_log.border_title = "📋 System Logs"
+        yield system_log
 
-    def _update_from_bridge(self) -> None:
-        """Update UI state from data bridge"""
+        # Footer
+        yield Footer()
+
+    def on_mount(self) -> None:
+        """Called when app starts"""
+        # Start the data update loop
+        self.set_interval(1.0 / self.refresh_rate, self.update_data)
+
+        # Add initial messages with soft colors
+        trans_log = self.query_one("#transcription", RichLog)
+        trans_log.write("[#b8b8d0]✨ Ready to listen...[/#b8b8d0]")
+
+        sys_log = self.query_one("#logs", RichLog)
+        sys_log.write("[#99ccff]⚡ System initialized[/#99ccff]")
+
+    def update_data(self) -> None:
+        """Update UI from data bridge (called periodically)"""
+        # Get mic widget
+        mic = self.query_one("#mic", MicMonitor)
+
         # Get all pending audio levels (keep only latest)
         latest_audio = None
         while True:
@@ -73,11 +210,13 @@ class JarvisUI:
 
         if latest_audio:
             # Convert amplitude to percentage (0-100)
-            # Use a lower threshold for more sensitive visualization
-            # Typical speech is around 500-2000 amplitude range
             speech_max = 2000.0
-            self.current_mic_level = min(100, (latest_audio.max_amplitude / speech_max) * 100)
-            self.peak_mic_level = max(self.peak_mic_level, self.current_mic_level)
+            level = min(100, (latest_audio.max_amplitude / speech_max) * 100)
+            mic.level = level
+            mic.peak = max(mic.peak, level)
+
+        # Get transcription log widget
+        trans_log = self.query_one("#transcription", RichLog)
 
         # Get all pending transcriptions
         while True:
@@ -86,12 +225,14 @@ class JarvisUI:
                 break
 
             timestamp = trans.timestamp.strftime("%H:%M:%S")
-            formatted = f"[{timestamp}] {trans.text}"
-            self.transcriptions.append(formatted)
+            trans_log.write(f"[#99ddbb][{timestamp}][/#99ddbb] [#e0e0e0]{trans.text}[/#e0e0e0]")
+            self.transcription_count += 1
 
-            # Keep last N transcriptions
-            if len(self.transcriptions) > self.log_history:
-                self.transcriptions = self.transcriptions[-self.log_history:]
+            # Update border title with count
+            trans_log.border_title = f"💬 Transcription ({self.transcription_count})"
+
+        # Get system log widget
+        sys_log = self.query_one("#logs", RichLog)
 
         # Get all pending logs
         while True:
@@ -99,198 +240,114 @@ class JarvisUI:
             if log is None:
                 break
 
-            # Format log with color based on level
+            # Format log with soft pastel colors based on level
             timestamp = log.timestamp.strftime("%H:%M:%S")
             level_colors = {
-                "DEBUG": "dim",
-                "INFO": "white",
-                "WARNING": "yellow",
-                "ERROR": "red",
-                "CRITICAL": "bold red"
+                "DEBUG": "#b8b8d0",
+                "INFO": "#99ccff",
+                "WARNING": "#ffcc99",
+                "ERROR": "#ff9999",
+                "CRITICAL": "#ff9999"
             }
-            color = level_colors.get(log.level, "white")
-            formatted = f"[{color}][{timestamp}] {log.level}: {log.message}[/{color}]"
-            self.logs.append(formatted)
+            level_icons = {
+                "DEBUG": "🔍",
+                "INFO": "ℹ️",
+                "WARNING": "⚠️",
+                "ERROR": "❌",
+                "CRITICAL": "🔥"
+            }
+            color = level_colors.get(log.level, "#e0e0e0")
+            icon = level_icons.get(log.level, "•")
+            sys_log.write(f"[{color}]{icon} [{timestamp}] {log.level}: {log.message}[/{color}]")
+            self.log_count += 1
 
-            # Keep last N logs
-            if len(self.logs) > self.log_history:
-                self.logs = self.logs[-self.log_history:]
+            # Update border title with count
+            sys_log.border_title = f"📋 System Logs ({self.log_count})"
 
-    def create_title_panel(self) -> Panel:
-        """Create the JARVIS title panel"""
-        # Simple compact title
-        title = Text("J A R V I S", style="bold cyan", justify="center")
 
-        return Panel(
-            title,
-            style="bold blue",
-            border_style="cyan",
-            padding=(0, 1)
-        )
+class JarvisUI:
+    """
+    Wrapper class to maintain API compatibility
+    Manages the Textual app lifecycle
+    """
 
-    def create_transcription_panel(self) -> Panel:
-        """Create the transcription/chat panel"""
-        if self.transcriptions:
-            # Show only the most recent 15 transcriptions that will fit
-            # This ensures the newest ones are always visible at the bottom
-            recent = self.transcriptions[-15:]
-            content = "\n".join(recent)
-        else:
-            content = "[dim]Waiting for speech...[/dim]"
+    def __init__(self, data_bridge: DataBridge, refresh_rate: int = 4, log_history: int = 50):
+        """
+        Initialize JARVIS UI
 
-        return Panel(
-            content,
-            title=f"[bold white]Transcription ({len(self.transcriptions)} total)[/bold white]",
-            border_style="green",
-            padding=(1, 2)
-        )
+        Args:
+            data_bridge: DataBridge instance for receiving data
+            refresh_rate: UI refresh rate in Hz
+            log_history: Not used in Textual version (kept for API compatibility)
+        """
+        self.app = JarvisApp(data_bridge, refresh_rate)
+        self.running = False
+        self._shutdown_callback = None
 
-    def create_mic_panel(self) -> Panel:
-        """Create the microphone activity panel"""
-        level = self.current_mic_level
+    def set_shutdown_callback(self, callback):
+        """Set callback to call when UI quits"""
+        self._shutdown_callback = callback
 
-        # Create a visual bar (20 characters wide to fit better)
-        bar_length = 20
-        filled = int((level / 100) * bar_length)
-        bar = "█" * filled + "░" * (bar_length - filled)
+    def start(self) -> None:
+        """Start UI (blocking call - runs in main thread)"""
+        if self.running:
+            return
 
-        # Color based on level
-        if level > 70:
-            color = "red"
-            status_text = "LOUD"
-            status_color = "bold red"
-        elif level > 40:
-            color = "yellow"
-            status_text = "ACTIVE"
-            status_color = "bold yellow"
-        elif level > 10:
-            color = "green"
-            status_text = "SPEAKING"
-            status_color = "bold green"
-        else:
-            color = "dim white"
-            status_text = "QUIET"
-            status_color = "dim"
-
-        content = Text()
-        content.append(bar, style=color)
-        content.append("\n\n")
-        content.append(f"{level:.0f}%", style="bold white")
-        content.append(f" / ", style="dim")
-        content.append(f"{self.peak_mic_level:.0f}%", style="dim")
-        content.append(f"\n\n")
-        content.append(f"{status_text}", style=status_color)
-
-        return Panel(
-            content,
-            title="[bold white]Mic[/bold white]",
-            border_style="magenta",
-            padding=(1, 1)
-        )
-
-    def create_logs_panel(self) -> Panel:
-        """Create the system logs panel"""
-        if self.logs:
-            # Show last 20 logs for better scrolling visibility
-            content = "\n".join(self.logs[-20:])
-        else:
-            content = "[dim]No system logs yet...[/dim]"
-
-        return Panel(
-            content,
-            title=f"[bold white]System Logs ({len(self.logs)} total)[/bold white]",
-            border_style="blue",
-            padding=(1, 2)
-        )
-
-    def create_layout(self) -> Layout:
-        """Create the dashboard layout"""
-        layout = Layout()
-
-        # Split into header and body
-        layout.split_column(
-            Layout(name="header", size=3),
-            Layout(name="body")
-        )
-
-        # Split body into top row (transcription | mic) and bottom row (logs)
-        layout["body"].split_column(
-            Layout(name="top_row", ratio=1),
-            Layout(name="bottom_row", ratio=1)
-        )
-
-        # Split top row into transcription (left, 80%) and mic (right, 20%)
-        layout["top_row"].split_row(
-            Layout(name="transcription", ratio=4),
-            Layout(name="mic", ratio=1, minimum_size=30)
-        )
-
-        # Populate panels
-        layout["header"].update(self.create_title_panel())
-        layout["transcription"].update(self.create_transcription_panel())
-        layout["mic"].update(self.create_mic_panel())
-        layout["bottom_row"].update(self.create_logs_panel())
-
-        return layout
-
-    def _run_ui(self) -> None:
-        """Run the UI with live updates (runs in background thread)"""
+        self.running = True
+        # Textual app.run() is blocking and handles its own event loop
         try:
-            with Live(
-                self.create_layout(),
-                refresh_per_second=self.refresh_rate,
-                console=self.console,
-                screen=True
-            ) as live:
-                while self.running:
-                    # Update state from data bridge
-                    self._update_from_bridge()
-
-                    # Update display
-                    live.update(self.create_layout())
-
-                    # Sleep based on refresh rate
-                    time.sleep(1.0 / self.refresh_rate)
-
-        except KeyboardInterrupt:
-            pass
-        except Exception as e:
-            # Log error but don't crash
-            self.console.print(f"\n[bold red]UI Error: {e}[/bold red]")
+            self.app.run()
         finally:
-            self.running = False
+            # Call shutdown callback when UI exits
+            if self._shutdown_callback:
+                self._shutdown_callback()
+
+    def stop(self) -> None:
+        """Stop UI"""
+        if not self.running:
+            return
+        self.running = False
+        try:
+            self.app.exit()
+        except Exception:
+            pass  # Ignore errors during shutdown
 
 
 if __name__ == "__main__":
     # Test UI with mock data bridge
-    from .data_bridge import DataBridge
     import random
+    import threading
+    import time
+    from .data_bridge import DataBridge
 
     bridge = DataBridge()
-    ui = JarvisUI(bridge, refresh_rate=4)
 
     # Update state
     bridge.update_state(model_loaded=True, mic_active=True)
 
-    # Start UI
-    ui.start()
-
-    # Send some test data
-    try:
-        for i in range(100):
+    # Start mock data generator in background
+    def generate_mock_data():
+        for i in range(200):
             # Send audio levels
             bridge.send_audio_level(
-                max_amp=random.uniform(0, 32768),
-                avg_amp=random.uniform(0, 16384)
+                max_amp=random.uniform(0, 2500),
+                avg_amp=random.uniform(0, 1250)
             )
 
             # Send transcription occasionally
-            if i % 10 == 0:
-                bridge.send_transcription(f"Test transcription {i // 10}")
+            if i % 15 == 0:
+                bridge.send_transcription(f"Test transcription number {i // 15}")
 
-            # Send logs
-            bridge.send_log("INFO", f"Test log message {i}")
+            # Send logs with varying levels
+            levels = ["INFO", "DEBUG", "WARNING", "ERROR"]
+            level = random.choice(levels)
+            bridge.send_log(level, f"Test {level.lower()} message {i}")
 
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        ui.stop()
+            time.sleep(0.3)
+
+    data_thread = threading.Thread(target=generate_mock_data, daemon=True)
+    data_thread.start()
+
+    # Start UI (blocking)
+    ui = JarvisUI(bridge, refresh_rate=4)
+    ui.start()

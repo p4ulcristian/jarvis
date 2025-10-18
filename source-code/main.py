@@ -6,31 +6,19 @@ Production-ready refactored version with modular architecture
 import os
 import sys
 import signal
+import threading
 from pathlib import Path
-from datetime import datetime
-import numpy as np
 from typing import Optional
 
-# Import core modules
-from core import (
-    Config,
-    setup_logging,
-    AudioCapture,
-    FrameASR,
-    RollingBuffer,
-    TranscriptionBuffer
-)
-from core.transcription import load_nemo_model
-
-# Import UI modules
+# Import ONLY UI modules at startup for fast loading
+# Heavy imports (numpy, NeMo, core modules) are deferred until needed
 from ui import DataBridge, JarvisUI
-from ui.data_bridge import UILogHandler
 
 
 class Jarvis:
     """Main JARVIS application"""
 
-    def __init__(self, config: Config, data_bridge: Optional[DataBridge] = None):
+    def __init__(self, config, data_bridge: Optional[DataBridge] = None):
         """
         Initialize JARVIS
 
@@ -38,6 +26,10 @@ class Jarvis:
             config: Configuration object
             data_bridge: Optional DataBridge for UI communication
         """
+        # Defer heavy imports until __init__
+        from core import setup_logging, RollingBuffer
+        from ui.data_bridge import UILogHandler
+
         self.config = config
         self.data_bridge = data_bridge
         self.logger = setup_logging(debug=config.debug_mode, name='jarvis')
@@ -65,11 +57,18 @@ class Jarvis:
         Returns:
             True if successful, False otherwise
         """
+        # Import only when needed
+        from core.transcription import load_nemo_model, FrameASR
+
         if not self.config.enable_model:
             self.logger.warning("Model loading disabled by config")
             if self.data_bridge:
                 self.data_bridge.update_state(model_loaded=False)
             return True
+
+        self.logger.info("Loading AI model (this may take 10-60 seconds)...")
+        if self.data_bridge:
+            self.data_bridge.send_log("INFO", "Loading NeMo Parakeet-TDT model (0.6B params)...")
 
         self.model = load_nemo_model(self.config)
         if self.model is None:
@@ -84,6 +83,7 @@ class Jarvis:
 
         if self.data_bridge:
             self.data_bridge.update_state(model_loaded=True)
+            self.data_bridge.send_log("INFO", "Model loaded successfully!")
 
         return True
 
@@ -94,6 +94,9 @@ class Jarvis:
         Returns:
             True if successful, False otherwise
         """
+        # Import only when needed
+        from core import AudioCapture
+
         if not self.config.enable_microphone:
             self.logger.warning("Microphone disabled by config")
             if self.data_bridge:
@@ -127,6 +130,11 @@ class Jarvis:
 
     def continuous_logging(self) -> None:
         """Main loop: continuous speech capture and transcription"""
+        # Import only when needed
+        import numpy as np
+        from datetime import datetime
+        from core import AudioCapture
+
         if not self.config.enable_microphone:
             self.logger.info("Microphone disabled, nothing to do")
             return
@@ -219,7 +227,7 @@ class Jarvis:
 
     def start(self) -> bool:
         """
-        Start JARVIS
+        Start JARVIS (assumes UI is already running if enabled)
 
         Returns:
             True if successful, False otherwise
@@ -235,7 +243,7 @@ class Jarvis:
         except Exception as e:
             self.logger.warning(f"Could not clear log files: {e}")
 
-        # Load model
+        # Load model (this is slow - UI should already be running)
         if not self.load_model():
             self.logger.error("Failed to load model")
             return False
@@ -268,22 +276,49 @@ _ui_instance = None
 _jarvis_instance = None
 
 
-def signal_handler(sig, frame):
-    """Handle SIGINT gracefully"""
+def shutdown_all():
+    """Shutdown both JARVIS and UI"""
     global _ui_instance, _jarvis_instance
-
-    print("\n\nShutting down JARVIS...")
 
     # Stop JARVIS
     if _jarvis_instance:
         _jarvis_instance.shutdown = True
         _jarvis_instance.cleanup()
+        _jarvis_instance = None
 
     # Stop UI
     if _ui_instance:
         _ui_instance.stop()
+        _ui_instance = None
 
     sys.exit(0)
+
+
+def signal_handler(sig, frame):
+    """Handle SIGINT gracefully"""
+    shutdown_all()
+
+
+def run_jarvis_main(config, data_bridge):
+    """Run JARVIS in a separate thread"""
+    global _jarvis_instance
+
+    try:
+        # Import Config here
+        from core import Config as ConfigClass
+
+        # Create JARVIS instance
+        jarvis = Jarvis(config, data_bridge=data_bridge)
+        _jarvis_instance = jarvis
+
+        # Start JARVIS (this will load model, initialize audio, and run)
+        jarvis.start()
+
+    except Exception as e:
+        if data_bridge:
+            data_bridge.send_log("ERROR", f"JARVIS failed: {e}")
+    finally:
+        _jarvis_instance = None
 
 
 def main():
@@ -294,49 +329,64 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
 
     try:
-        # Load configuration
-        config = Config()
+        # START UI IMMEDIATELY - before ANY heavy imports
+        # Just create the UI first, check config later
+        data_bridge = DataBridge()
+        ui = JarvisUI(
+            data_bridge,
+            refresh_rate=4,
+            log_history=50
+        )
+        _ui_instance = ui
 
-        # Validate config
-        errors = config.validate()
-        if errors:
-            print("Configuration errors:")
-            for error in errors:
-                print(f"  - {error}")
-            return 1
+        # Set shutdown callback
+        ui.set_shutdown_callback(shutdown_all)
 
-        # Create data bridge and UI if enabled
-        data_bridge = None
-        ui = None
-
-        if config.enable_ui:
+        # Start JARVIS initialization in background thread
+        def init_and_run():
             try:
-                data_bridge = DataBridge()
-                ui = JarvisUI(
-                    data_bridge,
-                    refresh_rate=config.ui_refresh_rate,
-                    log_history=config.ui_log_history
-                )
-                ui.start()
-                _ui_instance = ui  # Store for signal handler
+                # Now import Config (heavy import happens in background)
+                from core import Config
+
+                # Load config (user sees this in UI)
+                data_bridge.send_log("INFO", "Loading configuration...")
+                config = Config()
+
+                # Check if UI should actually be enabled
+                if not config.enable_ui:
+                    data_bridge.send_log("WARNING", "UI disabled in config but already running")
+
+                # Validate config
+                errors = config.validate()
+                if errors:
+                    for error in errors:
+                        data_bridge.send_log("ERROR", f"Config error: {error}")
+                    return
+
+                # Update UI with actual config values
+                data_bridge.send_log("INFO", "Configuration loaded successfully")
+
+                # Now run JARVIS main with loaded config
+                run_jarvis_main(config, data_bridge)
+
             except Exception as e:
-                print(f"Warning: UI failed to start, falling back to standard logging: {e}")
-                data_bridge = None
-                ui = None
+                data_bridge.send_log("ERROR", f"Initialization failed: {e}")
 
-        # Create and start JARVIS
-        jarvis = Jarvis(config, data_bridge=data_bridge)
-        _jarvis_instance = jarvis  # Store for signal handler
+        # Start background initialization
+        jarvis_thread = threading.Thread(
+            target=init_and_run,
+            daemon=False,
+            name="JARVIS-Thread"
+        )
+        jarvis_thread.start()
 
-        success = jarvis.start()
+        # Start UI in main thread (blocking) - appears instantly
+        ui.start()
 
-        # Stop UI if running
-        if ui:
-            ui.stop()
-            _ui_instance = None
+        # When UI exits, wait for JARVIS to finish
+        jarvis_thread.join(timeout=2.0)
 
-        _jarvis_instance = None
-        return 0 if success else 1
+        return 0
 
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")
