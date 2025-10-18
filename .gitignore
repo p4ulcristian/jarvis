@@ -43,6 +43,8 @@ logs/
 
 # Model files
 ai-detector/models/*.gguf
+source-code/ai-detector/models/*.gguf
+**/*.gguf
 
 # Test and prototype directories
 **/test/
