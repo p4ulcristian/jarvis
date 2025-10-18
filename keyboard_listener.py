@@ -2,9 +2,11 @@
 """
 Keyboard listener for Jarvis - logs all key presses
 Writes events to a file for consumption by the main process
+Displays keypresses in real-time
 """
 import time
 import sys
+from datetime import datetime
 from pynput import keyboard
 
 # File to write keyboard events
@@ -34,10 +36,39 @@ def get_key_name(key):
     except:
         return str(key)
 
+def format_key_display(key):
+    """Format key for display (make special keys readable)"""
+    try:
+        # Regular character keys
+        if hasattr(key, 'char') and key.char is not None:
+            # Show space visibly
+            if key.char == ' ':
+                return '[SPACE]'
+            # Show newlines
+            elif key.char == '\n':
+                return '[ENTER]'
+            elif key.char == '\t':
+                return '[TAB]'
+            else:
+                return key.char
+        # Special keys - show in brackets
+        elif hasattr(key, 'name'):
+            return f'[{key.name.upper()}]'
+        else:
+            key_str = str(key).replace('Key.', '')
+            return f'[{key_str.upper()}]'
+    except:
+        return '[UNKNOWN]'
+
 def on_press(key):
     """Called when a key is pressed"""
     key_name = get_key_name(key)
     write_event(key_name)
+
+    # Display in real-time with timestamp
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    display = format_key_display(key)
+    print(f"[{timestamp}] {display}", flush=True)
 
 def on_release(key):
     """Called when a key is released"""

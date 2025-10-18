@@ -1,0 +1,37 @@
+[Unit]
+Description=JARVIS Voice-to-Text System
+After=network.target sound.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=paul
+Group=paul
+WorkingDirectory=/home/paul/Work/jarvis
+Environment="PATH=/home/paul/Work/jarvis/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/paul/Work/jarvis/.env
+
+# Run the application
+ExecStart=/home/paul/Work/jarvis/venv/bin/python /home/paul/Work/jarvis/jarvis_v2.py
+
+# Restart policy
+Restart=on-failure
+RestartSec=10s
+StartLimitBurst=5
+StartLimitIntervalSec=60s
+
+# Resource limits
+MemoryLimit=8G
+CPUQuota=200%
+
+# Security hardening (adjust as needed)
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jarvis
+
+[Install]
+WantedBy=multi-user.target

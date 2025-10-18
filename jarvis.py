@@ -10,6 +10,11 @@ import sys
 # Save original stderr
 _original_stderr = sys.stderr
 
+# Fix malloc issues BEFORE any library imports
+os.environ['MALLOC_TRIM_THRESHOLD_'] = '0'
+os.environ['MALLOC_MMAP_THRESHOLD_'] = '131072'
+os.environ['MALLOC_MMAP_MAX_'] = '65536'
+
 # Suppress ALSA warnings BEFORE importing pyaudio
 os.environ['PYTHONWARNINGS'] = 'ignore'
 os.environ['ALSA_CONFIG_PATH'] = '/dev/null'
@@ -22,13 +27,13 @@ import time
 import subprocess
 import tempfile
 import json
-import threading
-import queue
 from pathlib import Path
 from datetime import datetime
 from collections import deque
 import logging
 import warnings
+import gc
+import ctypes
 
 # Suppress warnings and verbose output
 warnings.filterwarnings('ignore')
@@ -37,7 +42,7 @@ logging.getLogger().setLevel(logging.ERROR)
 import torch
 import numpy as np
 import nemo.collections.asr as nemo_asr
-import pyaudio
+import sounddevice as sd
 import wave
 from pynput.keyboard import Controller
 
@@ -49,11 +54,27 @@ _devnull.close()
 import nemo.utils
 logging.getLogger('nemo_logger').setLevel(logging.ERROR)
 
+# Fix PyTorch/NumPy memory allocator conflict
+# This must be done before any CUDA initialization
+# Use native allocator to avoid conflicts with PyAudio
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'backend:native'
+# Re-enable CUDA now that sounddevice fixed the malloc conflict
+# os.environ['CUDA_VISIBLE_DEVICES'] = ''  # Disabled - we can use GPU now!
+
+# Feature Flags - Enable/disable modules as needed
+ENABLE_MICROPHONE = True   # Audio capture ✓
+ENABLE_MODEL = True        # NeMo ASR model ✓
+ENABLE_VAD = True          # Voice activity detection ✓
+ENABLE_AI_DETECTION = False  # AI detection (disabled by default)
+ENABLE_TRANSCRIPTION = True  # Real-time transcription ✓
+
 # Constants
+DEBUG_MODE = False  # Set to True to see detailed audio/VAD/transcription logging
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 1600  # 100ms chunks at 16kHz
 CHANNELS = 1
 TRIGGER_FILE = "/tmp/jarvis-type-trigger"
+KEYBOARD_EVENT_FILE = "/tmp/jarvis-keyboard-events"
 LOG_FILE = "chat.txt"
 
 # Streaming ASR settings
@@ -90,29 +111,6 @@ DETECTION_COOLDOWN = 5  # seconds
 BUFFER_DURATION = 300  # 5 minutes in seconds
 
 
-class StreamingAudioBuffer:
-    """Continuous audio buffer for real-time streaming"""
-    def __init__(self, sample_rate=SAMPLE_RATE):
-        self.sample_rate = sample_rate
-        self.buffer = queue.Queue()
-        self.is_active = False
-
-    def get_chunk(self, timeout=0.1):
-        """Get next audio chunk as raw bytes"""
-        try:
-            return self.buffer.get(timeout=timeout)
-        except queue.Empty:
-            return None
-
-    def clear(self):
-        """Clear the buffer"""
-        while not self.buffer.empty():
-            try:
-                self.buffer.get_nowait()
-            except queue.Empty:
-                break
-
-
 class FrameASR:
     """
     Frame-based ASR for continuous streaming transcription
@@ -136,8 +134,9 @@ class FrameASR:
         Check if audio contains speech using energy-based VAD
         Returns: True if speech detected, False if silence
         """
-        # Convert to int16 range for amplitude check
-        audio_int16 = (audio * 32768).astype(np.int16)
+        # Convert to int16 range for amplitude check - avoid astype() malloc conflicts
+        audio_int16 = np.empty(audio.shape, dtype=np.int16)
+        np.multiply(audio, 32768, out=audio_int16, casting='unsafe')
 
         # Calculate absolute amplitude
         amplitude = np.abs(audio_int16)
@@ -155,6 +154,13 @@ class FrameASR:
         # Store last values for logging
         self.last_max_amplitude = max_amplitude
         self.last_avg_amplitude = avg_amplitude
+
+        # Debug logging
+        if DEBUG_MODE and debug:
+            status = "SPEECH" if has_speech else "SILENCE"
+            print(f"[DEBUG VAD] {status} | Max: {max_amplitude:5.0f} | Avg: {avg_amplitude:5.1f} | "
+                  f"Ratio: {speech_ratio*100:5.2f}% (threshold: {MIN_SPEECH_RATIO*100:.2f}%)")
+            sys.stdout.flush()
 
         return has_speech
 
@@ -185,6 +191,9 @@ class FrameASR:
             return ""
 
         # Transcribe current buffer
+        if DEBUG_MODE:
+            print("[DEBUG] Transcription starting...")
+            sys.stdout.flush()
         start_time = time.time()
         try:
             # Create temp file for transcription
@@ -197,8 +206,9 @@ class FrameASR:
             wf.setnchannels(CHANNELS)
             wf.setsampwidth(2)  # 16-bit
             wf.setframerate(self.sample_rate)
-            # Convert back to int16 for wav file
-            audio_int16 = (self.buffer * 32768).astype(np.int16)
+            # Convert back to int16 for wav file - avoid astype() malloc conflicts
+            audio_int16 = np.empty(self.buffer.shape, dtype=np.int16)
+            np.multiply(self.buffer, 32768, out=audio_int16, casting='unsafe')
             wf.writeframes(audio_int16.tobytes())
             wf.close()
 
@@ -224,8 +234,17 @@ class FrameASR:
 
             text = text.strip()
 
+            total_time = time.time() - start_time
+
+            if DEBUG_MODE:
+                print(f"[DEBUG] Transcription completed in {total_time:.2f}s | Raw text: '{text}'")
+                sys.stdout.flush()
+
             # Filter out empty or very short hallucinations
             if len(text) < 2:
+                if DEBUG_MODE:
+                    print(f"[DEBUG] Filtered: too short (len={len(text)})")
+                    sys.stdout.flush()
                 return ""
 
             # Apply word corrections
@@ -234,6 +253,9 @@ class FrameASR:
             # Filter common hallucination phrases
             text_lower = text.lower()
             if text_lower in HALLUCINATION_PHRASES:
+                if DEBUG_MODE:
+                    print(f"[DEBUG] Filtered: hallucination phrase")
+                    sys.stdout.flush()
                 return ""
 
             # Deduplication: check if same as previous
@@ -241,13 +263,23 @@ class FrameASR:
                 self.prev_text_count += 1
                 # If we see the same text 3+ times, it's likely a hallucination
                 if self.prev_text_count >= 3:
+                    if DEBUG_MODE:
+                        print(f"[DEBUG] Filtered: repeated 3+ times")
+                        sys.stdout.flush()
                     return ""
                 # Otherwise skip duplicate
+                if DEBUG_MODE:
+                    print(f"[DEBUG] Filtered: duplicate")
+                    sys.stdout.flush()
                 return ""
 
             # New text detected
             self.prev_text = text
             self.prev_text_count = 1
+
+            if DEBUG_MODE:
+                print(f"[DEBUG] ✓ Accepted text: '{text}'")
+                sys.stdout.flush()
 
             return text
 
@@ -325,6 +357,30 @@ class TranscriptionBuffer:
 class Jarvis:
     def __init__(self):
         self.model = None
+        self.keyboard = None
+
+        # sounddevice works natively with NumPy - no malloc conflicts!
+        print("Initializing audio...", end=' ', flush=True)
+        self.device_sample_rate = 48000  # Use 48kHz (widely supported)
+        self.needs_resampling = True
+        print("✓", flush=True)
+        self.transcription_buffer = TranscriptionBuffer()
+        self.frame_asr = None
+        self.audio_stream = None
+        self.last_trigger_time = 0
+        self.last_detection_time = 0
+        self.shutdown = False
+        self.conversation_improver_process = None
+
+        # Improved text cache
+        self.improved_cache = deque(maxlen=100)
+        self.improved_log_path = Path("chat-revised.txt")
+        self.improved_last_position = 0
+
+    def _init_pyaudio(self):
+        """Initialize PyAudio after model loading to avoid conflicts"""
+        if self.pyaudio is not None:
+            return  # Already initialized
 
         # Suppress ALSA warnings during PyAudio initialization
         _stderr_backup = sys.stderr
@@ -337,60 +393,67 @@ class Jarvis:
         self.device_sample_rate = self._detect_sample_rate()
         self.needs_resampling = (self.device_sample_rate != SAMPLE_RATE)
 
-        self.keyboard = Controller()
-        self.transcription_buffer = TranscriptionBuffer()
-        self.streaming_buffer = StreamingAudioBuffer()
-        self.frame_asr = None
-        self.audio_thread = None
-        self.last_trigger_time = 0
-        self.last_detection_time = 0
-        self.shutdown = False
-        self.streaming_mode = False
-        self.conversation_improver_process = None
-
-        # Improved text cache
-        self.improved_cache = deque(maxlen=100)
-        self.improved_log_path = Path("chat-revised.txt")
-        self.improved_last_position = 0
-
     def _detect_sample_rate(self):
         """Detect a supported sample rate for the default input device"""
-        # Just use 48000 Hz which is widely supported
-        # Avoid multiple stream opens which can cause PyAudio/ALSA corruption
+        # Use 48000 Hz which is widely supported
+        # We'll use simple decimation for resampling to avoid numpy/pytorch conflicts
         return 48000
 
     def _resample_audio(self, audio_data, orig_rate, target_rate):
-        """Resample audio from orig_rate to target_rate using linear interpolation"""
+        """Resample audio using simple decimation to avoid numpy/pytorch memory conflicts"""
         if orig_rate == target_rate:
             return audio_data
 
         if len(audio_data) == 0:
             return audio_data
 
-        # Calculate resampling ratio
-        ratio = target_rate / orig_rate
-        new_length = int(len(audio_data) * ratio)
+        # For 48kHz -> 16kHz, we can use simple decimation (take every 3rd sample)
+        # This avoids numpy memory allocation that conflicts with PyTorch CUDA
+        if orig_rate == 48000 and target_rate == 16000:
+            # Simple decimation: take every 3rd sample
+            return audio_data[::3]
 
-        if new_length == 0:
-            return np.array([], dtype=np.int16)
+        # For other rates, use stride-based decimation
+        stride = int(orig_rate / target_rate)
+        if stride > 1:
+            return audio_data[::stride]
 
-        # Use numpy interpolation
-        try:
-            indices = np.linspace(0, len(audio_data) - 1, new_length)
-            resampled = np.interp(indices, np.arange(len(audio_data)), audio_data.astype(np.float64))
-            return resampled.astype(np.int16)
-        except Exception as e:
-            print(f"[ERROR] Resampling failed: {e}", file=sys.stderr)
-            return audio_data
+        # If upsampling is needed, just repeat samples (simple but works)
+        if stride < 1:
+            repeat_factor = int(target_rate / orig_rate)
+            return np.repeat(audio_data, repeat_factor)
+
+        return audio_data
 
     def load_model(self):
         """Load NeMo ASR model with word boosting"""
+        if not ENABLE_MODEL:
+            print("Model loading DISABLED (feature flag)")
+            return True
+
         print("Loading NeMo Parakeet-TDT model...", end=' ', flush=True)
+        sys.stdout.flush()
 
         try:
+            # Set environment variables to prevent threading conflicts
+            os.environ['OMP_NUM_THREADS'] = '1'
+            os.environ['MKL_NUM_THREADS'] = '1'
+            os.environ['NUMEXPR_NUM_THREADS'] = '1'
+
+            print("\n[DEBUG] About to call from_pretrained...", flush=True)
+            torch.set_num_threads(1)  # Limit PyTorch threading
             self.model = nemo_asr.models.ASRModel.from_pretrained(
                 "nvidia/parakeet-tdt-0.6b-v3"
             )
+            print("\n[DEBUG] from_pretrained completed", flush=True)
+
+            # Force garbage collection and malloc trim after model loading
+            gc.collect()
+            try:
+                libc = ctypes.CDLL("libc.so.6")
+                libc.malloc_trim(0)
+            except:
+                pass
 
             if torch.cuda.is_available():
                 self.model = self.model.cuda()
@@ -399,10 +462,41 @@ class Jarvis:
             else:
                 print("✓ (CPU)")
 
+            # Configure GPU-PB word boosting
+            boost_file = Path("boost_words.txt")
+            if boost_file.exists():
+                try:
+                    # Read and prepare key phrases (must be capitalized for Parakeet-TDT)
+                    with open(boost_file, 'r') as f:
+                        key_phrases = [line.strip() for line in f if line.strip()]
+
+                    if key_phrases:
+                        print(f"\n[Word Boost] Loaded {len(key_phrases)} phrases: {', '.join(key_phrases)}")
+
+                        # Configure GPU-PB decoding strategy
+                        from omegaconf import OmegaConf
+                        decoding_cfg = OmegaConf.create({
+                            'strategy': 'greedy_batch',
+                            'context_score': 1.0,
+                            'depth_scaling': 1.0,  # 1.0 for Parakeet-TDT/Canary models
+                            'boosting_tree_alpha': 0.3,  # Shallow fusion weight (tune between 0-1)
+                            'key_phrases_list': key_phrases
+                        })
+
+                        self.model.change_decoding_strategy(decoding_cfg)
+                        print("[Word Boost] GPU-PB enabled ✓")
+                except Exception as e:
+                    print(f"\n[WARNING] Failed to enable word boosting: {e}")
+            else:
+                print(f"\n[INFO] No boost_words.txt found, word boosting disabled")
+
             self.model.eval()
 
             # Initialize frame-based ASR for streaming
-            self.frame_asr = FrameASR(self.model)
+            if ENABLE_TRANSCRIPTION:
+                self.frame_asr = FrameASR(self.model)
+            else:
+                self.frame_asr = None
 
             sys.stdout.flush()
             return True
@@ -560,9 +654,42 @@ class Jarvis:
             pass
         return False
 
+    def read_keyboard_events(self, lookback_ms=200):
+        """Read recent keyboard events from keyboard_listener.py"""
+        try:
+            if not os.path.exists(KEYBOARD_EVENT_FILE):
+                return []
+
+            current_time = int(time.time() * 1000)
+            events = []
+
+            with open(KEYBOARD_EVENT_FILE, 'r') as f:
+                lines = f.readlines()
+                # Check last 100 lines (most recent events)
+                for line in lines[-100:]:
+                    line = line.strip()
+                    if ':' in line:
+                        key, timestamp_str = line.rsplit(':', 1)
+                        timestamp = int(timestamp_str)
+                        if current_time - timestamp < lookback_ms:
+                            events.append(key)
+
+            return events
+        except Exception as e:
+            return []
+
+    def is_ctrl_pressed(self):
+        """Check if Ctrl key was pressed recently"""
+        events = self.read_keyboard_events(lookback_ms=200)
+        return 'ctrl' in events or 'ctrl_l' in events or 'ctrl_r' in events
+
     def type_text(self, text):
         """Type text using keyboard"""
         try:
+            # Lazy-initialize keyboard controller to avoid threading conflicts
+            if self.keyboard is None:
+                self.keyboard = Controller()
+
             for char in text:
                 self.keyboard.type(char)
                 time.sleep(0.01)  # Small delay between characters
@@ -610,62 +737,37 @@ class Jarvis:
             print(f"[ERROR] AI detection failed: {e}", file=sys.stderr)
             return (False, False)
 
-    def audio_capture_thread(self):
-        """Background thread for continuous audio capture"""
-        try:
-            # Use device sample rate directly - NO numpy operations in this thread
-            # Any numpy operations cause segfaults in background thread
-            device_chunk_size = int(CHUNK_SIZE * self.device_sample_rate / SAMPLE_RATE)
+    def push_to_talk_mode(self):
+        """Push-to-talk: record while Ctrl is held"""
+        print("\n[PUSH-TO-TALK] Recording... (release Ctrl to stop)")
+        sys.stdout.flush()
 
-            stream = self.pyaudio.open(
-                format=pyaudio.paInt16,
-                channels=CHANNELS,
-                rate=self.device_sample_rate,
-                input=True,
-                frames_per_buffer=device_chunk_size
-            )
+        audio_file = self.record_until_condition(
+            lambda: not self.is_ctrl_pressed()
+        )
 
-            while self.streaming_mode and not self.shutdown:
-                try:
-                    # Read audio chunk - keep as raw bytes
-                    audio_data = stream.read(device_chunk_size, exception_on_overflow=False)
+        if not audio_file:
+            print("[ERROR] Failed to record")
+            return
 
-                    # Store raw bytes directly - no numpy operations
-                    # Conversion happens in main thread when processing
-                    self.streaming_buffer.buffer.put(audio_data)
+        # Check if file has content
+        file_size = os.path.getsize(audio_file)
+        if file_size < 20000:
+            print("[SILENT] No speech detected")
+            os.unlink(audio_file)
+            return
 
-                except KeyboardInterrupt:
-                    break
-                except Exception as e:
-                    print(f"[ERROR] Audio capture error: {e}", file=sys.stderr)
-                    time.sleep(0.1)
+        # Transcribe
+        text = self.transcribe_audio(audio_file)
+        os.unlink(audio_file)
 
-            stream.stop_stream()
-            stream.close()
+        if text:
+            self.log_conversation(text)
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}]")
+            print(text)
+            sys.stdout.flush()
 
-        except KeyboardInterrupt:
-            pass
-        except Exception as e:
-            print(f"[ERROR] Audio thread failed: {e}")
-            self.streaming_mode = False
-
-    def start_streaming_capture(self):
-        """Start background audio capture"""
-        if not self.streaming_mode:
-            self.streaming_mode = True
-            self.streaming_buffer.clear()
-            self.audio_thread = threading.Thread(target=self.audio_capture_thread, daemon=True)
-            self.audio_thread.start()
-            time.sleep(0.2)  # Let thread initialize
-
-    def stop_streaming_capture(self):
-        """Stop background audio capture"""
-        if self.streaming_mode:
-            self.streaming_mode = False
-            if self.audio_thread:
-                self.audio_thread.join(timeout=1.0)
-            self.streaming_buffer.clear()
-
+            self.type_text(text)
 
     def typing_mode(self):
         """Typing mode: record fixed duration and type with countdown"""
@@ -703,28 +805,149 @@ class Jarvis:
             self.type_text(text)
 
     def continuous_logging(self):
-        """Main loop: trigger file only for typing mode"""
-        print("[INFO] Create /tmp/jarvis-type-trigger for typing mode\n")
+        """Main loop: continuous speech capture with AI detection"""
+        if not ENABLE_MICROPHONE:
+            print("[INFO] Microphone DISABLED (feature flag)")
+            print("[INFO] Nothing to do, exiting...")
+            return
+
+        if not ENABLE_MODEL:
+            print("[INFO] MICROPHONE TEST MODE - Model disabled")
+            print("[INFO] Will capture audio but NOT transcribe\n")
+        else:
+            print("[INFO] Starting continuous speech capture...")
+            print("[INFO] Create /tmp/jarvis-type-trigger for typing mode\n")
         sys.stdout.flush()
 
+        # Calculate chunk size for sounddevice
+        chunk_duration_sec = CHUNK_SIZE / SAMPLE_RATE  # seconds per chunk
+
+        if DEBUG_MODE:
+            print(f"[DEBUG] Will use chunk duration: {chunk_duration_sec}s, rate: {SAMPLE_RATE}Hz")
+            sys.stdout.flush()
+
+        # Accumulator for audio chunks
+        audio_accumulator = []
+        last_ai_check = 0
+        chunks_captured = 0
+
+        # sounddevice doesn't need stream opening - just call sd.rec() in the loop
+        if DEBUG_MODE:
+            print(f"[DEBUG] Audio ready (sounddevice)")
+            sys.stdout.flush()
+
         try:
+            iteration = 0
             while not self.shutdown:
                 try:
+                    iteration += 1
+                    if DEBUG_MODE and iteration % 100 == 0:
+                        print(f"[DEBUG] Main loop iteration {iteration}", flush=True)
+
                     # Check for trigger file
                     if self.check_trigger_file():
                         print("\n[TRIGGER DETECTED] Switching to typing mode...")
                         sys.stdout.flush()
                         self.typing_mode()
+                        audio_accumulator = []
                         continue
 
-                    # Just sleep and wait for user input
-                    time.sleep(0.1)
+                    # Read audio chunk using sounddevice (returns numpy array directly!)
+                    if DEBUG_MODE and iteration == 1:
+                        print(f"[DEBUG] About to read first audio chunk (size: {CHUNK_SIZE})", flush=True)
+                        sys.stdout.flush()
 
+                    # sounddevice returns numpy array directly - no malloc conflicts!
+                    device_chunk_size = int(CHUNK_SIZE * self.device_sample_rate / SAMPLE_RATE)
+                    audio_np = sd.rec(device_chunk_size, samplerate=self.device_sample_rate, channels=CHANNELS, dtype='int16', blocking=True)
+                    audio_np = audio_np.flatten()  # Convert from (N,1) to (N,)
+
+                    # Resample 48kHz -> 16kHz using simple decimation
+                    if self.needs_resampling:
+                        audio_np = audio_np[::3]  # Take every 3rd sample
+
+                    if DEBUG_MODE and iteration == 1:
+                        print(f"[DEBUG] Successfully read audio chunk, shape: {audio_np.shape}", flush=True)
+                        sys.stdout.flush()
+
+                    chunks_captured += 1
+                    if DEBUG_MODE and iteration == 1:
+                        print(f"[DEBUG] chunks_captured incremented to {chunks_captured}", flush=True)
+
+                    # Convert to float32 (sounddevice already gave us a proper numpy array)
+                    if DEBUG_MODE and iteration == 1:
+                        print(f"[DEBUG] Converting to float32...", flush=True)
+                    audio_float = audio_np.astype(np.float32) / 32768.0
+
+                    if DEBUG_MODE and iteration == 1:
+                        print(f"[DEBUG] Appending to accumulator...", flush=True)
+                    # Accumulate chunks
+                    audio_accumulator.append(audio_float)
+
+                    if DEBUG_MODE and iteration == 1:
+                        print(f"[DEBUG] First chunk processed successfully!", flush=True)
+
+                    # Process when we have enough audio (1.6 seconds for frame)
+                    total_samples = sum(len(chunk) for chunk in audio_accumulator)
+                    if total_samples >= int(FRAME_LEN * SAMPLE_RATE):
+                        if DEBUG_MODE:
+                            print(f"[DEBUG] Processing frame: {total_samples} samples ({total_samples/SAMPLE_RATE:.2f}s of audio)")
+                            sys.stdout.flush()
+                        # Combine accumulated audio
+                        combined_audio = np.concatenate(audio_accumulator)
+
+                        # MICROPHONE TEST MODE: Just print stats, don't transcribe
+                        if not ENABLE_MODEL or not ENABLE_TRANSCRIPTION:
+                            print(f"[MIC TEST] Captured {total_samples} samples ({total_samples/SAMPLE_RATE:.2f}s) - max amplitude: {np.max(np.abs(combined_audio)):.3f}")
+                            sys.stdout.flush()
+                        else:
+                            # Transcribe the chunk
+                            text = self.frame_asr.transcribe_chunk(combined_audio)
+
+                            if text:
+                                # Log to file
+                                self.log_conversation(text)
+
+                                # Add to buffer for AI detection
+                                self.transcription_buffer.add(text)
+
+                                # Check AI detection periodically
+                                if ENABLE_AI_DETECTION:
+                                    now = time.time()
+                                    if now - last_ai_check >= DETECTION_COOLDOWN:
+                                        should_check, is_ai = self.check_ai_detection(text)
+                                        if should_check:
+                                            timestamp = datetime.now().strftime('%H:%M:%S')
+                                            self.display_formatted_output(text, is_ai, timestamp)
+                                            last_ai_check = now
+                                    else:
+                                        # Just print raw text if not checking AI
+                                        print(f"[{datetime.now().strftime('%H:%M:%S')}] {text}")
+                                        sys.stdout.flush()
+                                else:
+                                    # Just print raw text
+                                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {text}")
+                                    sys.stdout.flush()
+
+                        # Reset accumulator but keep overlap for continuity
+                        overlap_samples = int(0.4 * SAMPLE_RATE)  # 400ms overlap
+                        if len(combined_audio) > overlap_samples:
+                            audio_accumulator = [combined_audio[-overlap_samples:]]
+                        else:
+                            audio_accumulator = []
+
+                except KeyboardInterrupt:
+                    raise
                 except Exception as e:
                     print(f"[ERROR] Main loop error: {e}")
+                    import traceback
+                    traceback.print_exc()
                     time.sleep(0.1)
 
         except KeyboardInterrupt:
+            pass
+        finally:
+            # sounddevice cleans up automatically
             pass
 
     def start(self):
@@ -735,9 +958,9 @@ class Jarvis:
 
         # Show audio device info
         if self.needs_resampling:
-            print(f"Audio: {self.device_sample_rate}Hz → 16kHz (resampling)")
+            print(f"Audio: {self.device_sample_rate}Hz → {SAMPLE_RATE}Hz (sounddevice)")
         else:
-            print(f"Audio: {self.device_sample_rate}Hz")
+            print(f"Audio: {SAMPLE_RATE}Hz (sounddevice)")
 
         sys.stdout.flush()
 
@@ -751,27 +974,29 @@ class Jarvis:
         if not self.load_model():
             return False
 
+        # PyAudio already initialized in __init__ before model loading
+
         # Start keyboard listener
         print("Starting keyboard listener...", end=' ', flush=True)
         try:
-            subprocess.Popen([sys.executable, "keyboard_listener.py"],
-                           stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
-            time.sleep(0.5)
-            print("✓")
+            # DISABLED: subprocess causes memory corruption with PyAudio
+            # subprocess.Popen([sys.executable, "keyboard_listener.py"])
+            # time.sleep(0.5)
+            print("✗ (disabled - causes conflicts)")
         except Exception as e:
             print(f"✗ (push-to-talk unavailable)")
 
         # Start conversation improver
         print("Starting conversation improver...", end=' ', flush=True)
         try:
-            self.conversation_improver_process = subprocess.Popen(
-                [sys.executable, "conversation_improver.py"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            time.sleep(0.5)
-            print("✓")
+            # DISABLED: subprocess may cause conflicts with PyAudio
+            # self.conversation_improver_process = subprocess.Popen(
+            #     [sys.executable, "conversation_improver.py"],
+            #     stdout=subprocess.DEVNULL,
+            #     stderr=subprocess.DEVNULL
+            # )
+            # time.sleep(0.5)
+            print("✗ (disabled - causes conflicts)")
         except Exception as e:
             print(f"✗")
 
@@ -904,7 +1129,8 @@ class Jarvis:
     def cleanup(self):
         """Cleanup resources"""
         self.shutdown = True
-        self.stop_streaming_capture()
+
+        # sounddevice cleans up automatically - no need to terminate
 
         # Stop conversation improver
         if self.conversation_improver_process:
@@ -917,13 +1143,6 @@ class Jarvis:
         # Cleanup keyboard controller (suppress pynput cleanup exception)
         try:
             del self.keyboard
-        except:
-            pass
-
-        # Terminate pyaudio safely
-        try:
-            if hasattr(self, 'pyaudio') and self.pyaudio:
-                self.pyaudio.terminate()
         except:
             pass
 

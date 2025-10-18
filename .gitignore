@@ -27,7 +27,23 @@ venv/
 *.tmp
 *.log
 *.jsonl
+*.mp3
 conversation.json
+
+# Log and data files
+chat.txt
+chat-revised.txt
+data/
+logs/
+
+# Process management
+*.pid
+*.sock
 
 # Model files
 ai-detector/models/*.gguf
+
+# Test and prototype directories
+**/test/
+**/*_test/
+**/*-test/

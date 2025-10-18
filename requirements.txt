@@ -1,15 +1,33 @@
 # JARVIS - Voice-to-Text System Requirements
+# Production-ready dependencies with version pinning
 
-# NeMo ASR
-nemo_toolkit[asr]
-torch>=2.0.0
+# Core ML/ASR
+nemo_toolkit[asr]==2.1.0
+torch==2.5.1
+torchaudio==2.5.1
 
-# Audio
-pyaudio
-numpy
+# Audio Processing
+sounddevice==0.5.1
+scipy==1.14.1
+librosa==0.10.2
+numpy==1.26.4
+wave; python_version >= "3.0"
 
-# Keyboard & typing
-pynput
+# Keyboard & Typing
+pynput==1.7.7
 
-# Utilities
-requests
+# Configuration & Environment
+python-dotenv==1.0.1
+pyyaml==6.0.2
+
+# LLM Integration
+requests==2.32.3
+
+# Logging & Monitoring (optional)
+prometheus-client==0.21.0
+
+# Development Dependencies (optional)
+# pytest==8.3.4
+# pytest-cov==6.0.0
+# black==24.10.0
+# ruff==0.7.4
