@@ -67,6 +67,11 @@ class Config:
         # Debug
         self.debug_mode = self._get_bool('DEBUG_MODE', False)
 
+        # Terminal UI
+        self.enable_ui = self._get_bool('ENABLE_UI', True)
+        self.ui_refresh_rate = self._get_int('UI_REFRESH_RATE', 4)
+        self.ui_log_history = self._get_int('UI_LOG_HISTORY', 50)
+
         # Monitoring
         self.enable_metrics = self._get_bool('ENABLE_METRICS', False)
         self.metrics_port = self._get_int('METRICS_PORT', 9090)
