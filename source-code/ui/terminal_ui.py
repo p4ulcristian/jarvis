@@ -49,17 +49,18 @@ class ToggleButton(Button):
 
 
 class MicMonitor(Static):
-    """Widget to display microphone activity level"""
+    """Widget to display microphone activity level and PTT status"""
 
     level = reactive(0.0)
     peak = reactive(0.0)
+    ptt_active = reactive(False)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.border_title = "[MIC] Audio Input"
+        self.border_title = "[MIC] Audio + Status"
 
     def render(self) -> Text:
-        """Render the mic level display as compact Pip-Boy style vertical bar meter"""
+        """Render the mic level display and PTT status"""
         level = self.level
 
         # Compact vertical bar meter (5 segments)
@@ -106,33 +107,54 @@ class MicMonitor(Static):
                 content.append(f"{i*20}%\n", style="#226622")
 
         content.append(f"{icon} {status_text} ", style=status_color)
-        content.append(f"P:{self.peak:.0f}%", style="#226622")
+        content.append(f"P:{self.peak:.0f}%\n\n", style="#226622")
 
-        return content
-
-
-class KeyStatusWidget(Static):
-    """Widget to display keyboard hotkey status"""
-
-    ptt_active = reactive(False)
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.border_title = "[Type Mode] Status"
-
-    def render(self) -> Text:
-        """Render compact PTT status display"""
-        content = Text()
-
-        # Compact Type mode status
-        content.append("Type mode: ", style="#33ff33")
+        # Add PTT status
+        content.append("Type Mode: ", style="#33ff33")
         if self.ptt_active:
-            content.append("ON", style="bold #00ff00")
-            content.append(" ●", style="#00ff00")
+            content.append("ON ●", style="bold #00ff00")
         else:
             content.append("OFF", style="#226622")
 
         return content
+
+
+class ChatWindow(Static):
+    """Widget to display chat conversation"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.border_title = "[</>] Chat"
+        self.chat_log = None
+
+    def compose(self) -> ComposeResult:
+        """Create chat log widget"""
+        self.chat_log = RichLog(
+            highlight=True,
+            markup=True,
+            wrap=True
+        )
+        yield self.chat_log
+
+    def add_message(self, role: str, text: str, timestamp: datetime, backend: Optional[str] = None):
+        """Add a message to the chat window"""
+        if not self.chat_log:
+            return
+
+        time_str = timestamp.strftime("%H:%M:%S")
+
+        if role == "user":
+            # User messages in bright green
+            self.chat_log.write(f"[#00ff00][{time_str}] YOU:[/#00ff00] [#33ff33]{text}[/#33ff33]")
+        elif role == "jarvis":
+            # Jarvis messages with backend indicator
+            backend_indicator = ""
+            if backend == "claude_code":
+                backend_indicator = " [#ffaa00]<CODE>[/#ffaa00]"
+            elif backend == "ollama":
+                backend_indicator = " [#33ff33]<AI>[/#33ff33]"
+
+            self.chat_log.write(f"[#00ff00][{time_str}] JARVIS{backend_indicator}:[/#00ff00] [#33ff33]{text}[/#33ff33]")
 
 
 class JarvisApp(App):
@@ -148,13 +170,13 @@ class JarvisApp(App):
     CSS = """
     Screen {
         layout: grid;
-        grid-size: 5 5;
-        grid-rows: 2 1fr 3 1fr 1;
+        grid-size: 2 4;
+        grid-rows: 2 1fr 1fr 1;
         background: #0a0e0a;
     }
 
     #header {
-        column-span: 5;
+        column-span: 2;
         height: 2;
         layout: horizontal;
         background: #0d1409;
@@ -171,45 +193,10 @@ class JarvisApp(App):
         text-opacity: 95%;
     }
 
-    #button-bar {
-        width: auto;
-        height: 100%;
-        align: right middle;
-        padding: 0 2;
-    }
-
-    ToggleButton {
-        margin: 0 1;
-        min-width: 15;
-        height: 1;
-    }
-
-    ToggleButton.passive {
-        background: #0d1409;
-        color: #226622;
-        border: none;
-    }
-
-    ToggleButton.passive:hover {
-        background: #162812;
-        color: #338833;
-    }
-
-    ToggleButton.active {
-        background: #00ff00;
-        color: #000000;
-        text-style: bold;
-        border: none;
-    }
-
-    ToggleButton.active:hover {
-        background: #33ff33;
-        color: #000000;
-    }
-
+    /* Top Left: Transcription */
     #transcription {
-        column-span: 4;
-        row-span: 2;
+        column-span: 1;
+        row-span: 1;
         border: heavy #00ff00;
         border-title-color: #33ff33;
         border-subtitle-color: #226622;
@@ -217,34 +204,44 @@ class JarvisApp(App):
         height: 100%;
     }
 
-    #mic {
+    /* Top Right: Chat Window */
+    #chat {
         column-span: 1;
+        row-span: 1;
         border: heavy #00ff00;
         border-title-color: #33ff33;
         background: #0d1409;
         height: 100%;
-        padding: 1;
     }
 
-    #key-status {
-        column-span: 1;
-        border: heavy #00ff00;
-        border-title-color: #33ff33;
+    ChatWindow RichLog {
+        border: none;
         background: #0d1409;
-        height: 100%;
-        padding: 1;
     }
 
+    /* Bottom Left: System Logs */
     #logs {
-        column-span: 5;
+        column-span: 1;
+        row-span: 1;
         border: heavy #00ff00;
         border-title-color: #33ff33;
         background: #0d1409;
         height: 100%;
+    }
+
+    /* Bottom Right: Audio Levels + Status */
+    #audio-status {
+        column-span: 1;
+        row-span: 1;
+        border: heavy #00ff00;
+        border-title-color: #33ff33;
+        background: #0d1409;
+        height: 100%;
+        padding: 1;
     }
 
     Footer {
-        column-span: 5;
+        column-span: 2;
         background: #0d1409;
         color: #33ff33;
     }
@@ -273,36 +270,36 @@ class JarvisApp(App):
         self.last_keyboard_check_pos = 0
 
     def compose(self) -> ComposeResult:
-        """Create child widgets"""
+        """Create child widgets for 4-quadrant layout"""
         # Header with title
         with Container(id="header"):
             yield Static("[:: J A R V I S ::]", id="title")
 
-        # Transcription log (scrollable)
+        # Top Left: Transcription log (scrollable)
         transcription_log = RichLog(
             highlight=True,
             markup=True,
             id="transcription"
         )
         transcription_log.border_title = "[>>] Transcription"
-        transcription_log.border_subtitle = "scroll: ↑↓ pgup/pgdn | export: e | select: shift+mouse"
+        transcription_log.border_subtitle = "select: shift+mouse | export: e"
         yield transcription_log
 
-        # Mic monitor
-        yield MicMonitor(id="mic")
+        # Top Right: Chat window (scrollable)
+        yield ChatWindow(id="chat")
 
-        # Key status widget (shows Ctrl key state)
-        yield KeyStatusWidget(id="key-status")
-
-        # System logs (scrollable)
+        # Bottom Left: System logs (scrollable)
         system_log = RichLog(
             highlight=True,
             markup=True,
             id="logs"
         )
         system_log.border_title = "[==] System Logs"
-        system_log.border_subtitle = "export: e | select: shift+mouse"
+        system_log.border_subtitle = "export: e"
         yield system_log
+
+        # Bottom Right: Audio levels + compact status
+        yield MicMonitor(id="audio-status")
 
         # Footer
         yield Footer()
@@ -318,6 +315,11 @@ class JarvisApp(App):
 
         sys_log = self.query_one("#logs", RichLog)
         sys_log.write("[#00ff00][==] System initialized[/#00ff00]")
+
+        # Initialize chat window
+        chat_widget = self.query_one("#chat", ChatWindow)
+        if chat_widget.chat_log:
+            chat_widget.chat_log.write("[#33ff33][</>] Chat mode ready - say 'Jarvis' to start...[/#33ff33]")
 
     def check_keyboard_events(self) -> None:
         """Check for keyboard events and handle < key press/release"""
@@ -348,32 +350,20 @@ class JarvisApp(App):
                 if len(parts) >= 1:
                     key_name = parts[0]
 
-                    # Get the key status widget
-                    key_status = self.query_one("#key-status", KeyStatusWidget)
-
                     # Check for Push-to-Talk start
                     if key_name == 'PTT_START':
-                        # Update key status widget
-                        key_status.ptt_active = True
-
                         # Update state in data bridge
                         self.data_bridge.update_state(ptt_active=True)
                         self.data_bridge.send_log("INFO", "⌨️  Type Mode Active (transcriptions will be typed on release)")
 
                     # Check for Push-to-Talk stop (transcribe and type)
                     elif key_name == 'PTT_STOP':
-                        # Update key status widget
-                        key_status.ptt_active = False
-
                         # Update state in data bridge
                         self.data_bridge.update_state(ptt_active=False)
                         self.data_bridge.send_log("INFO", "⏸️  Type Mode: Typing transcription...")
 
                     # Check for Push-to-Talk cancel (Ctrl+key combo)
                     elif key_name == 'PTT_CANCEL':
-                        # Update key status widget
-                        key_status.ptt_active = False
-
                         # Update state in data bridge
                         self.data_bridge.update_state(ptt_active=False)
                         self.data_bridge.send_log("INFO", "❌ Type Mode cancelled (keyboard combo detected)")
@@ -443,8 +433,12 @@ class JarvisApp(App):
 
     def update_data(self) -> None:
         """Update UI from data bridge (called periodically)"""
-        # Get mic widget
-        mic = self.query_one("#mic", MicMonitor)
+        # Get mic/audio widget
+        mic = self.query_one("#audio-status", MicMonitor)
+
+        # Update PTT status from state
+        state = self.data_bridge.get_state()
+        mic.ptt_active = state.ptt_active
 
         # Get all pending audio levels (keep only latest)
         latest_audio = None
@@ -509,6 +503,30 @@ class JarvisApp(App):
 
             # Update border title with count
             sys_log.border_title = f"[==] System Logs ({self.log_count})"
+
+        # Get chat window widget
+        chat_widget = self.query_one("#chat", ChatWindow)
+
+        # Get all pending chat messages
+        chat_count = 0
+        while True:
+            chat = self.data_bridge.get_chat_message(timeout=0.001)
+            if chat is None:
+                break
+
+            # Add message to chat window
+            chat_widget.add_message(
+                role=chat.role,
+                text=chat.text,
+                timestamp=chat.timestamp,
+                backend=chat.backend
+            )
+            chat_count += 1
+
+        # Update chat border title if messages were added
+        if chat_count > 0:
+            total_messages = len(chat_widget.chat_log.lines) if chat_widget.chat_log else 0
+            chat_widget.border_title = f"[</>] Chat ({total_messages})"
 
         # Check for keyboard events (Control key to enable Type Mode)
         self.check_keyboard_events()

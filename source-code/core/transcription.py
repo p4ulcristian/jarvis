@@ -42,11 +42,15 @@ for handler in _root_logger.handlers[:]:
     if isinstance(handler, logging.StreamHandler) and handler.stream in (sys.stdout, sys.stderr):
         _root_logger.removeHandler(handler)
 
-# Suppress Python warnings from NeMo/Lhotse
+# Suppress Python warnings from NeMo/Lhotse/Hydra/OmegaConf
 warnings.filterwarnings('ignore', category=UserWarning, module='nemo')
 warnings.filterwarnings('ignore', category=UserWarning, module='lhotse')
+warnings.filterwarnings('ignore', category=UserWarning, module='hydra')
+warnings.filterwarnings('ignore', category=UserWarning, module='omegaconf')
 warnings.filterwarnings('ignore', category=FutureWarning, module='nemo')
 warnings.filterwarnings('ignore', category=FutureWarning, module='lhotse')
+warnings.filterwarnings('ignore', category=FutureWarning, module='hydra')
+warnings.filterwarnings('ignore', category=FutureWarning, module='omegaconf')
 
 import numpy as np
 import torch
@@ -538,8 +542,9 @@ def load_nemo_model(config: Config) -> Optional[EncDecMultiTaskModel]:
         torch.set_num_threads(1)
 
         # Load Canary multi-task model
-        # NOTE: Not suppressing output during load to capture any errors
-        model = EncDecMultiTaskModel.from_pretrained(config.model_name)
+        # Suppress NeMo warnings during model load
+        with suppress_nemo_output():
+            model = EncDecMultiTaskModel.from_pretrained(config.model_name)
 
         # Move to GPU if available
         if torch.cuda.is_available():

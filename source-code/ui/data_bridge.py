@@ -34,6 +34,15 @@ class SystemLog:
 
 
 @dataclass
+class ChatMessage:
+    """Chat message data"""
+    role: str  # "user" or "jarvis"
+    text: str
+    timestamp: datetime
+    backend: Optional[str] = None  # "ollama", "claude_code", or None
+
+
+@dataclass
 class SystemState:
     """System state information"""
     model_loaded: bool
@@ -41,6 +50,7 @@ class SystemState:
     processing: bool
     type_mode: bool
     ptt_active: bool  # Push-to-talk active state
+    chat_active: bool  # Chat mode active state
     error: Optional[str]
 
 
@@ -61,6 +71,7 @@ class DataBridge:
         self.audio_queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
         self.transcription_queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
         self.log_queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
+        self.chat_queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
 
         # State (thread-safe with lock)
         self._state_lock = threading.Lock()
@@ -70,6 +81,7 @@ class DataBridge:
             processing=False,
             type_mode=False,
             ptt_active=False,
+            chat_active=False,
             error=None
         )
 
@@ -173,6 +185,42 @@ class DataBridge:
         except queue.Empty:
             return None
 
+    # Chat Message Methods
+    def send_chat_message(self, role: str, text: str, backend: Optional[str] = None) -> None:
+        """
+        Send chat message to UI
+
+        Args:
+            role: Message role ("user" or "jarvis")
+            text: Message text
+            backend: Backend used ("ollama", "claude_code", or None)
+        """
+        try:
+            data = ChatMessage(
+                role=role,
+                text=text,
+                timestamp=datetime.now(),
+                backend=backend
+            )
+            self.chat_queue.put_nowait(data)
+        except queue.Full:
+            pass  # Drop if queue is full
+
+    def get_chat_message(self, timeout: float = 0.01) -> Optional[ChatMessage]:
+        """
+        Get latest chat message (non-blocking)
+
+        Args:
+            timeout: Timeout in seconds
+
+        Returns:
+            ChatMessage or None
+        """
+        try:
+            return self.chat_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
     # System State Methods
     def update_state(self, **kwargs) -> None:
         """
@@ -200,6 +248,7 @@ class DataBridge:
                 processing=self._state.processing,
                 type_mode=self._state.type_mode,
                 ptt_active=self._state.ptt_active,
+                chat_active=self._state.chat_active,
                 error=self._state.error
             )
 

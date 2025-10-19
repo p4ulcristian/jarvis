@@ -52,6 +52,11 @@ class JarvisService:
         self.transcription_buffer = RollingBuffer(max_duration=config.buffer_duration)
         self.keyboard_typer = None
         self.transcription_worker = None
+        self.claude_code_handler = None
+
+        # Chat mode components
+        self.conversation_manager = None
+        self.response_processor = None
 
         # State management
         self.shutdown = False
@@ -164,6 +169,97 @@ class JarvisService:
             self.logger.warning(f"Could not initialize keyboard typer: {e}")
             return False
 
+    def initialize_claude_code_handler(self) -> bool:
+        """
+        Initialize Claude Code handler for voice-driven coding
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.config.enable_claude_code:
+            self.logger.info("Claude Code integration disabled by config")
+            return True
+
+        try:
+            from services.claude_code_handler import ClaudeCodeHandler
+
+            self.claude_code_handler = ClaudeCodeHandler(
+                trigger_words=[w.strip() for w in self.config.claude_code_trigger_words],
+                project_path=self.config.claude_code_project_path,
+                allowed_tools=[t.strip() for t in self.config.claude_code_allowed_tools],
+                enabled=self.config.enable_claude_code
+            )
+
+            if self.claude_code_handler.enabled:
+                self.logger.info(f"Claude Code handler initialized with triggers: {self.config.claude_code_trigger_words}")
+                if self.data_bridge:
+                    self.data_bridge.send_log("INFO", f"Claude Code integration enabled - say '{self.config.claude_code_trigger_words[0]}' to code")
+                return True
+            else:
+                self.logger.warning("Claude Code handler disabled - SDK not available")
+                if self.data_bridge:
+                    self.data_bridge.send_log("WARNING", "Claude Code SDK not installed - voice coding disabled")
+                return False
+
+        except Exception as e:
+            self.logger.warning(f"Could not initialize Claude Code handler: {e}")
+            if self.data_bridge:
+                self.data_bridge.send_log("WARNING", f"Claude Code initialization failed: {e}")
+            return False
+
+    def initialize_chat_mode(self) -> bool:
+        """
+        Initialize chat mode components (Qwen Agent + TTS)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.config.enable_chat_mode:
+            self.logger.info("Chat mode disabled by config")
+            return True
+
+        try:
+            from services.simple_conversation_manager import SimpleConversationManager
+            from services.qwen_agent import QwenAgent
+            from services.response_processor import ResponseProcessor
+
+            # Initialize response processor (TTS)
+            self.response_processor = ResponseProcessor(
+                default_personality=self.config.tts_personality,
+                enabled=True
+            )
+
+            if not self.response_processor.is_available():
+                self.logger.warning("TTS (say.sh) not available - chat responses will be silent")
+                if self.data_bridge:
+                    self.data_bridge.send_log("WARNING", "TTS unavailable - responses will be silent")
+
+            # Initialize Qwen Agent with Claude Code as a tool
+            qwen_agent = QwenAgent(
+                model=self.config.chat_model,
+                system_prompt=self.config.chat_system_prompt,
+                claude_handler=self.claude_code_handler,
+                max_history=10,
+                max_tts_sentences=self.config.max_tts_sentences
+            )
+
+            # Initialize conversation manager
+            self.conversation_manager = SimpleConversationManager(
+                wake_word=self.config.wake_word,
+                qwen_agent=qwen_agent
+            )
+
+            self.logger.info(f"Chat mode initialized: wake_word='{self.config.wake_word}', model={self.config.chat_model}")
+            if self.data_bridge:
+                self.data_bridge.send_log("INFO", f"Chat mode ready - say '{self.config.wake_word}' to chat")
+            return True
+
+        except Exception as e:
+            self.logger.warning(f"Could not initialize chat mode: {e}", exc_info=True)
+            if self.data_bridge:
+                self.data_bridge.send_log("WARNING", f"Chat mode initialization failed: {e}")
+            return False
+
     def log_conversation(self, text: str) -> None:
         """
         Log conversation to file
@@ -268,8 +364,38 @@ class JarvisService:
                                                 # Continue polling
 
                                         if result and result.success and result.text:
-                                            # Paste the transcription
-                                            if self.keyboard_typer:
+                                            # Check for Claude Code trigger words first
+                                            claude_command_detected = False
+                                            if self.claude_code_handler and self.claude_code_handler.enabled:
+                                                command = self.claude_code_handler.detect_trigger(result.text)
+                                                if command:
+                                                    claude_command_detected = True
+                                                    self.logger.info(f"Claude Code command detected: '{command}'")
+                                                    if self.data_bridge:
+                                                        self.data_bridge.send_log("INFO", f"Executing: {command[:50]}...")
+                                                        self.data_bridge.send_transcription(f"[CLAUDE CODE] {result.text}")
+
+                                                    # Execute Claude Code command (async, non-blocking)
+                                                    try:
+                                                        success = self.claude_code_handler.execute_command_sync(command)
+                                                        if success:
+                                                            self.logger.info("Claude Code command executed successfully")
+                                                            if self.data_bridge:
+                                                                self.data_bridge.send_log("INFO", "Claude Code command completed")
+                                                        else:
+                                                            self.logger.warning("Claude Code command failed")
+                                                            if self.data_bridge:
+                                                                self.data_bridge.send_log("WARNING", "Claude Code command failed")
+                                                    except Exception as e:
+                                                        self.logger.error(f"Claude Code execution error: {e}", exc_info=True)
+                                                        if self.data_bridge:
+                                                            self.data_bridge.send_log("ERROR", f"Claude Code error: {e}")
+
+                                                    if self.data_bridge:
+                                                        self.data_bridge.update_state(processing=False)
+
+                                            # Only paste text if it wasn't a Claude Code command
+                                            if not claude_command_detected and self.keyboard_typer:
                                                 try:
                                                     self.keyboard_typer.paste_text(result.text)
                                                     self.logger.debug(f"PTT typed: {result.text} (latency: {elapsed:.1f}s)")
@@ -402,6 +528,60 @@ class JarvisService:
                                             timestamp = datetime.now().strftime('%H:%M:%S')
                                             self.logger.info(f"[{timestamp}] {result.text}")
 
+                                        # Check for wake word (chat mode)
+                                        if self.conversation_manager and self.response_processor:
+                                            command = self.conversation_manager.detect_wake_word(result.text)
+                                            if command:
+                                                self.logger.info(f"Wake word detected - command: '{command}'")
+
+                                                # Send user message to chat UI
+                                                if self.data_bridge:
+                                                    self.data_bridge.send_chat_message("user", result.text)
+                                                    self.data_bridge.update_state(chat_active=True)
+
+                                                # Acknowledge via TTS (non-blocking)
+                                                self.response_processor.acknowledge(blocking=False)
+
+                                                # Process command via Qwen Agent (async)
+                                                try:
+                                                    import asyncio
+
+                                                    # Run async chat in sync context
+                                                    loop = asyncio.new_event_loop()
+                                                    asyncio.set_event_loop(loop)
+                                                    try:
+                                                        agent_response = loop.run_until_complete(
+                                                            self.conversation_manager.process_command(command)
+                                                        )
+
+                                                        # Log response
+                                                        self.logger.info(f"Agent response: {agent_response.short_text}")
+
+                                                        # Send assistant response to chat UI
+                                                        if self.data_bridge:
+                                                            backend_used = agent_response.tool_used or "ollama"
+                                                            self.data_bridge.send_chat_message(
+                                                                "jarvis",
+                                                                agent_response.text,
+                                                                backend=backend_used
+                                                            )
+
+                                                        # Speak response via TTS (short version)
+                                                        if agent_response.success and agent_response.short_text:
+                                                            self.response_processor.speak_response(
+                                                                full_response=agent_response.text,
+                                                                short_response=agent_response.short_text,
+                                                                blocking=False
+                                                            )
+                                                    finally:
+                                                        loop.close()
+
+                                                except Exception as e:
+                                                    self.logger.error(f"Error processing chat command: {e}", exc_info=True)
+                                                    if self.data_bridge:
+                                                        self.data_bridge.send_log("ERROR", f"Chat error: {e}")
+                                                        self.data_bridge.update_state(chat_active=False)
+
                                     elif not result.success:
                                         # Log transcription errors
                                         if result.error:
@@ -447,6 +627,12 @@ class JarvisService:
 
         # Initialize keyboard typer
         self.initialize_keyboard_typer()
+
+        # Initialize Claude Code handler
+        self.initialize_claude_code_handler()
+
+        # Initialize chat mode (Qwen Agent + TTS)
+        self.initialize_chat_mode()
 
         # Load model (slow operation)
         if not self.load_model():

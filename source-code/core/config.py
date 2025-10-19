@@ -79,6 +79,17 @@ class Config:
         self.ollama_url = self._get_str('OLLAMA_URL', 'http://localhost:11434/api/generate')
         self.ollama_model = self._get_str('OLLAMA_MODEL', 'qwen2.5:3b-instruct')
 
+        # Chat Mode Configuration
+        self.chat_model = self._get_str('CHAT_MODEL', 'qwen3:8b')
+        self.wake_word = self._get_str('WAKE_WORD', 'jarvis')
+        self.tts_personality = self._get_str('TTS_PERSONALITY', 'helpful and friendly')
+        self.max_tts_sentences = self._get_int('MAX_TTS_SENTENCES', 2)
+        self.chat_system_prompt = self._get_str('CHAT_SYSTEM_PROMPT',
+            'You are Jarvis, a helpful voice assistant. '
+            'Respond in 1-2 sentences maximum for voice output. '
+            'Be casual, friendly, and concise.')
+        self.enable_chat_mode = self._get_bool('ENABLE_CHAT_MODE', True)
+
         # Debug
         self.debug_mode = self._get_bool('DEBUG_MODE', False)
 
@@ -111,6 +122,12 @@ class Config:
         # Monitoring
         self.enable_metrics = self._get_bool('ENABLE_METRICS', False)
         self.metrics_port = self._get_int('METRICS_PORT', 9090)
+
+        # Claude Code Integration
+        self.enable_claude_code = self._get_bool('ENABLE_CLAUDE_CODE', True)
+        self.claude_code_trigger_words = self._get_str('CLAUDE_CODE_TRIGGER_WORDS', 'jarvis,hey jarvis,jarvis code').split(',')
+        self.claude_code_project_path = self._get_str('CLAUDE_CODE_PROJECT_PATH', str(Path(__file__).parent.parent.parent))
+        self.claude_code_allowed_tools = self._get_str('CLAUDE_CODE_ALLOWED_TOOLS', 'Read,Edit,Write,Bash,Grep,Glob').split(',')
 
     @staticmethod
     def _get_str(key: str, default: str) -> str:
