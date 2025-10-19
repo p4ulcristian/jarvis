@@ -20,7 +20,7 @@ export OPENAI_API_KEY="your-key-here"
 ./jarvis.py
 ```
 
-First run will download the NeMo Parakeet-TDT model (~600MB).
+First run will download the NVIDIA Canary-1B Flash model (~1.7GB) - state-of-the-art ASR with 1000+ RTFx performance.
 
 ## What It Does Right Now
 
@@ -41,8 +41,10 @@ First run will download the NeMo Parakeet-TDT model (~600MB).
          │
          ▼
 ┌─────────────────────────────────┐
-│  NeMo Parakeet-TDT ASR          │
-│  (Streaming transcription)      │
+│  NVIDIA Canary-1B Flash         │
+│  (1000+ RTFx real-time ASR)     │
+│  - 4 languages supported        │
+│  - Translation ready            │
 └────────┬────────────────────────┘
          │
          ▼
@@ -162,11 +164,15 @@ sudo usermod -a -G input $USER
 ```
 
 ### GPU out of memory
-The model uses ~2-3GB VRAM. For CPU mode, edit `jarvis.py`:
+Canary-1B Flash uses ~2GB VRAM. Close other GPU applications if needed.
+
+For CPU mode (slower), edit `config.py` and add to transcription.py:
 ```python
-# In load_model(), remove the .cuda() call
-self.model = self.model.cpu()
+# In load_nemo_model(), remove .cuda()
+model = model.cpu()
 ```
+
+**Note**: CPU mode will be significantly slower (~10-50x)
 
 ## Roadmap
 

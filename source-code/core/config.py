@@ -47,7 +47,14 @@ class Config:
         self.frame_len = self._get_float('FRAME_LEN', 1.6)
 
         # Model Configuration
-        self.model_name = self._get_str('MODEL_NAME', 'nvidia/parakeet-tdt-0.6b-v3')
+        self.model_name = self._get_str('MODEL_NAME', 'nvidia/canary-1b-flash')
+
+        # Canary-specific Configuration
+        self.canary_task = self._get_str('CANARY_TASK', 'asr')  # asr or ast (speech translation)
+        self.canary_source_lang = self._get_str('CANARY_SOURCE_LANG', 'en')  # en, de, fr, es
+        self.canary_target_lang = self._get_str('CANARY_TARGET_LANG', 'en')  # en, de, fr, es
+        self.canary_pnc = self._get_str('CANARY_PNC', 'yes')  # yes/no for punctuation and capitalization
+        self.canary_beam_size = self._get_int('CANARY_BEAM_SIZE', 1)  # 1 for greedy decoding (fastest)
 
         # Streaming Configuration
         self.streaming_chunk_size = self._get_int('STREAMING_CHUNK_SIZE', 8)  # Number of frames per chunk
@@ -79,6 +86,27 @@ class Config:
         self.enable_ui = self._get_bool('ENABLE_UI', True)
         self.ui_refresh_rate = self._get_int('UI_REFRESH_RATE', 4)
         self.ui_log_history = self._get_int('UI_LOG_HISTORY', 50)
+
+        # Keyboard & Typing
+        self.typing_delay = self._get_float('TYPING_DELAY', 0.01)  # seconds between keystrokes
+        self.paste_clipboard_delay = self._get_float('PASTE_CLIPBOARD_DELAY', 0.05)  # clipboard sync delay
+
+        # Shutdown & Process Management
+        self.shutdown_timeout = self._get_float('SHUTDOWN_TIMEOUT', 5.0)  # seconds per component
+        self.process_startup_timeout = self._get_float('PROCESS_STARTUP_TIMEOUT', 3.0)  # keyboard listener startup
+        self.graceful_shutdown_timeout = self._get_float('GRACEFUL_SHUTDOWN_TIMEOUT', 2.0)  # process termination
+
+        # Error Recovery & Resilience
+        self.audio_capture_max_retries = self._get_int('AUDIO_CAPTURE_MAX_RETRIES', 3)
+        self.audio_capture_retry_delay = self._get_float('AUDIO_CAPTURE_RETRY_DELAY', 1.0)  # seconds
+        self.transcription_max_retries = self._get_int('TRANSCRIPTION_MAX_RETRIES', 2)
+        self.transcription_retry_delay = self._get_float('TRANSCRIPTION_RETRY_DELAY', 0.5)  # seconds
+        self.enable_error_recovery = self._get_bool('ENABLE_ERROR_RECOVERY', True)
+
+        # Health Checks
+        self.enable_health_checks = self._get_bool('ENABLE_HEALTH_CHECKS', True)
+        self.health_check_interval = self._get_float('HEALTH_CHECK_INTERVAL', 30.0)  # seconds
+        self.health_check_audio_timeout = self._get_float('HEALTH_CHECK_AUDIO_TIMEOUT', 5.0)  # seconds
 
         # Monitoring
         self.enable_metrics = self._get_bool('ENABLE_METRICS', False)

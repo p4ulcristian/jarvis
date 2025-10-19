@@ -1,6 +1,6 @@
 """
-ASR Transcription with NeMo Parakeet-TDT
-Real-time transcription with buffering for accuracy
+ASR Transcription with NVIDIA Canary-1B Flash
+Real-time transcription with state-of-the-art accuracy (1000+ RTFx)
 """
 import os
 import sys
@@ -13,34 +13,22 @@ import re
 import numpy as np
 import torch
 import nemo.collections.asr as nemo_asr
+from nemo.collections.asr.models import EncDecMultiTaskModel
 
 from .config import Config
+from .constants import (
+    HALLUCINATION_PHRASES,
+    WORD_CORRECTIONS,
+    MIN_TEXT_LENGTH,
+    MAX_CHAR_REPEATS,
+    MAX_CHUNK_DURATION_SECONDS,
+    MIN_BUFFER_DURATION,
+    MAX_BUFFER_DURATION,
+    SILENCE_CHUNKS_TO_FLUSH
+)
+from .retry import exponential_backoff, RetryExhausted
 
 logger = logging.getLogger(__name__)
-
-
-# Common hallucinations to filter out (keep this minimal!)
-# NOTE: Only filter phrases that are clearly hallucinations, not common words
-HALLUCINATION_PHRASES = {
-    'thanks for watching', 'please subscribe',
-    'uh', 'um', 'ah', 'mm', 'hmm',
-    '.', '...'
-    # Removed: 'you', 'okay', 'ok', 'thank you' - these are real words!
-}
-
-# Word corrections for common misrecognitions
-WORD_CORRECTIONS = {
-    'jarve': 'Jarvis',
-    'jarvy': 'Jarvis',
-    'jarry': 'Jarvis',
-    'jervis': 'Jarvis',
-    'jarvie': 'Jarvis',
-    'jarvey': 'Jarvis',
-    'jadrice': 'Jarvis',
-    'jobies': 'Jarvis',
-    'jarbies': 'Jarvis',
-    'jeremies': 'Jarvis',
-}
 
 
 class TranscriptionBuffer:
@@ -66,7 +54,7 @@ class TranscriptionBuffer:
 
 class FrameASR:
     """
-    Real-time ASR for transcription with Parakeet-TDT
+    Real-time ASR for transcription with Canary-1B Flash
     Accumulates speech chunks for better accuracy
     """
 
@@ -93,12 +81,19 @@ class FrameASR:
 
         # Speech accumulation buffer (accumulate speech before transcribing)
         self.speech_buffer = []
-        self.min_buffer_duration = 0.4  # seconds - reduced for faster response
-        self.max_buffer_duration = 3.0  # seconds - max before forcing flush
-        self.silence_chunks_to_flush = 2  # flush after 2 silence chunks (200ms)
+        self.min_buffer_duration = MIN_BUFFER_DURATION
+        self.max_buffer_duration = MAX_BUFFER_DURATION
+        self.silence_chunks_to_flush = SILENCE_CHUNKS_TO_FLUSH
         self.silence_count = 0
 
+        # Error recovery configuration
+        self.max_retries = config.transcription_max_retries if config.enable_error_recovery else 0
+        self.retry_delay = config.transcription_retry_delay
+        self.consecutive_failures = 0
+
         logger.info("Frame ASR initialized for real-time transcription")
+        if config.enable_error_recovery:
+            logger.info(f"Transcription error recovery enabled: max_retries={self.max_retries}")
 
     def has_speech(self, audio: np.ndarray, debug: bool = False) -> bool:
         """
@@ -147,6 +142,10 @@ class FrameASR:
         self.speech_buffer.append(chunk)
         self.silence_count = 0
 
+    def increment_silence(self) -> None:
+        """Increment silence counter when silence is detected"""
+        self.silence_count += 1
+
     def should_transcribe(self) -> bool:
         """Check if we have enough audio to transcribe"""
         if not self.speech_buffer:
@@ -171,14 +170,14 @@ class FrameASR:
 
         audio = np.concatenate(self.speech_buffer)
         duration = len(audio) / self.sample_rate
-        logger.info(f"Flushing buffer: {duration:.2f}s of audio ({len(self.speech_buffer)} chunks)")
+        logger.debug(f"Flushing buffer: {duration:.2f}s of audio ({len(self.speech_buffer)} chunks)")
         self.speech_buffer = []
         self.silence_count = 0
         return audio
 
     def transcribe_chunk(self, chunk: np.ndarray) -> str:
         """
-        Transcribe an audio chunk in real-time
+        Transcribe an audio chunk in real-time with retry logic
 
         Args:
             chunk: Audio chunk as float32 array
@@ -189,12 +188,25 @@ class FrameASR:
         if chunk is None or len(chunk) == 0:
             return ""
 
-        start_time = time.time()
+        # Safety check: Canary-1B trained on <30s audio
+        # Reject chunks longer than MAX_CHUNK_DURATION_SECONDS to prevent hallucinations
+        duration = len(chunk) / self.sample_rate
+        if duration > MAX_CHUNK_DURATION_SECONDS:
+            logger.warning(
+                f"Chunk too long ({duration:.1f}s), "
+                f"truncating to {MAX_CHUNK_DURATION_SECONDS}s to prevent hallucinations"
+            )
+            max_samples = int(MAX_CHUNK_DURATION_SECONDS * self.sample_rate)
+            chunk = chunk[:max_samples]
+            duration = MAX_CHUNK_DURATION_SECONDS
 
-        try:
+        def _do_transcribe() -> str:
+            """Internal transcription function for retry logic"""
             import tempfile
             import wave
             import os
+
+            start_time = time.time()
 
             # NeMo's transcribe() works best with WAV files
             # Create a temporary WAV file with proper format
@@ -202,66 +214,104 @@ class FrameASR:
             tmp_path = temp_file.name
             temp_file.close()
 
-            # Write audio to WAV file with 16-bit samples
-            with wave.open(tmp_path, 'wb') as wf:
-                wf.setnchannels(1)  # Mono
-                wf.setsampwidth(2)  # 16-bit
-                wf.setframerate(self.sample_rate)
+            try:
+                # Write audio to WAV file with 16-bit samples
+                with wave.open(tmp_path, 'wb') as wf:
+                    wf.setnchannels(1)  # Mono
+                    wf.setsampwidth(2)  # 16-bit
+                    wf.setframerate(self.sample_rate)
 
-                # Convert float32 to int16
-                audio_int16 = np.empty(chunk.shape, dtype=np.int16)
-                np.multiply(chunk, 32768, out=audio_int16, casting='unsafe')
-                wf.writeframes(audio_int16.tobytes())
+                    # Convert float32 to int16
+                    audio_int16 = np.empty(chunk.shape, dtype=np.int16)
+                    np.multiply(chunk, 32768, out=audio_int16, casting='unsafe')
+                    wf.writeframes(audio_int16.tobytes())
 
-            # Transcribe the file
-            result = self.model.transcribe([tmp_path], verbose=False)
+                # Transcribe the file
+                # Canary-1B Flash returns Hypothesis objects with .text attribute
+                result = self.model.transcribe([tmp_path], verbose=False)
 
-            # Clean up temp file
-            os.unlink(tmp_path)
+                logger.debug(f"Transcribe result type: {type(result)}, length: {len(result) if result else 0}")
 
-            logger.info(f"Transcribe result type: {type(result)}, length: {len(result) if result else 0}")
+                # Extract text from Canary result (format: result[0].text)
+                text = ""
+                if result and len(result) > 0:
+                    first = result[0]
+                    logger.debug(f"First result type: {type(first)}, value: {first}")
 
-            # Extract text from result
-            text = ""
-            if result and len(result) > 0:
-                first = result[0]
-                logger.info(f"First result type: {type(first)}, value: {first}")
+                    # Canary/EncDecMultiTaskModel returns Hypothesis objects
+                    if hasattr(first, 'text'):
+                        text = first.text
+                        logger.debug(f"Got .text attribute: '{text}'")
+                    elif isinstance(first, str):
+                        text = first
+                        logger.debug(f"Got string directly: '{text}'")
+                    else:
+                        text = str(first)
+                        logger.debug(f"Converted to string: '{text}'")
 
-                # Check if it's a Hypothesis object with .text attribute
-                if hasattr(first, 'text'):
-                    text = first.text
-                    logger.info(f"Got .text attribute: '{text}'")
-                elif isinstance(first, str):
-                    text = first
-                    logger.info(f"Got string directly: '{text}'")
+                elapsed = time.time() - start_time
+
+                # Log RAW output before any processing (only in debug mode)
+                if text:
+                    logger.debug(f"[RAW OUTPUT] '{text}' ({elapsed*1000:.0f}ms)")
                 else:
-                    text = str(first)
-                    logger.info(f"Converted to string: '{text}'")
+                    logger.debug(f"Transcription in {elapsed*1000:.1f}ms | Raw: '' (empty)")
 
-            elapsed = time.time() - start_time
+                # Filter and process
+                processed_text = self._process_text(text)
 
-            # Log RAW output before any processing
-            if text:
-                logger.info(f"[RAW OUTPUT] '{text}' ({elapsed*1000:.0f}ms)")
-            else:
-                logger.debug(f"Transcription in {elapsed*1000:.1f}ms | Raw: '' (empty)")
+                # Log if filtering changed anything (only warnings and debug)
+                if text and not processed_text:
+                    logger.debug(f"[FILTERED OUT] '{text}' was filtered")
+                elif processed_text:
+                    logger.debug(f"[FINAL] '{processed_text}'")
 
-            # Filter and process
-            processed_text = self._process_text(text)
+                return processed_text
 
-            # Log if filtering changed anything
-            if text and not processed_text:
-                logger.warning(f"[FILTERED OUT] '{text}' was filtered")
-            elif processed_text:
-                logger.info(f"[FINAL] '{processed_text}'")
+            finally:
+                # Always clean up temp file
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
-            return processed_text
-
-        except Exception as e:
-            import traceback
-            logger.error(f"Transcription failed: {e}")
-            logger.error(f"Full traceback:\n{traceback.format_exc()}")
-            return ""
+        # Try transcription with retry logic if enabled
+        if self.max_retries > 0:
+            try:
+                result = exponential_backoff(
+                    _do_transcribe,
+                    max_retries=self.max_retries,
+                    initial_delay=self.retry_delay,
+                    max_delay=5.0,
+                    exponential_base=2.0,
+                    exceptions=(Exception,)
+                )
+                # Success - reset failure counter
+                if self.consecutive_failures > 0:
+                    logger.info("Transcription recovered after failures")
+                    self.consecutive_failures = 0
+                return result
+            except RetryExhausted:
+                self.consecutive_failures += 1
+                logger.error(
+                    f"Transcription failed after {self.max_retries} retries "
+                    f"(consecutive failures: {self.consecutive_failures})"
+                )
+                return ""
+            except Exception as e:
+                import traceback
+                logger.error(f"Unexpected transcription error: {e}")
+                logger.error(f"Full traceback:\n{traceback.format_exc()}")
+                return ""
+        else:
+            # No retry - single attempt
+            try:
+                return _do_transcribe()
+            except Exception as e:
+                import traceback
+                logger.error(f"Transcription failed: {e}")
+                logger.error(f"Full traceback:\n{traceback.format_exc()}")
+                return ""
 
     def _extract_text(self, result) -> str:
         """Extract text from NeMo result"""
@@ -280,9 +330,32 @@ class FrameASR:
         original_text = text
 
         # Filter too short
-        if len(text) < 2:
-            logger.debug(f"Filtered: too short (len={len(text)})")
+        if len(text) < MIN_TEXT_LENGTH:
+            logger.debug(f"Filtered: too short (len={len(text)}, min={MIN_TEXT_LENGTH})")
             return ""
+
+        # Filter Canary-1B repetition hallucinations (e.g., "Dohhhhhhhh...")
+        # Check for excessive character repetition (likely hallucination)
+        if len(text) > 50:
+            # Count consecutive repeated characters
+            max_repeats = 1
+            current_repeats = 1
+            prev_char = ''
+            for char in text:
+                if char == prev_char and char.isalpha():
+                    current_repeats += 1
+                    max_repeats = max(max_repeats, current_repeats)
+                else:
+                    current_repeats = 1
+                prev_char = char
+
+            # If more than MAX_CHAR_REPEATS repeated characters, it's likely a hallucination
+            if max_repeats > MAX_CHAR_REPEATS:
+                logger.warning(
+                    f"Filtered repetition hallucination: '{text[:100]}...' "
+                    f"(max_repeats={max_repeats}, threshold={MAX_CHAR_REPEATS})"
+                )
+                return ""
 
         # Apply word corrections
         text = self._apply_corrections(text)
@@ -338,9 +411,9 @@ class FrameASR:
         logger.debug("ASR state reset")
 
 
-def load_nemo_model(config: Config) -> Optional[nemo_asr.models.ASRModel]:
+def load_nemo_model(config: Config) -> Optional[EncDecMultiTaskModel]:
     """
-    Load NeMo ASR model (Parakeet-TDT by default)
+    Load NeMo ASR model (Canary-1B Flash)
 
     Args:
         config: Configuration object
@@ -362,27 +435,27 @@ def load_nemo_model(config: Config) -> Optional[nemo_asr.models.ASRModel]:
 
         torch.set_num_threads(1)
 
-        # Load streaming model
-        model = nemo_asr.models.ASRModel.from_pretrained(config.model_name)
+        # Load Canary multi-task model
+        model = EncDecMultiTaskModel.from_pretrained(config.model_name)
 
         # Move to GPU if available
         if torch.cuda.is_available():
             model = model.cuda()
             device_name = torch.cuda.get_device_name(0)
-            logger.info(f"Parakeet-TDT loaded on GPU: {device_name}")
+            logger.info(f"Canary-1B Flash loaded on GPU: {device_name}")
         else:
-            logger.info("Parakeet-TDT loaded on CPU")
+            logger.info("Canary-1B Flash loaded on CPU")
 
-        # Enable streaming mode if available (not all streaming models have this method)
+        # Configure greedy decoding for optimal speed/accuracy
+        decode_cfg = model.cfg.decoding
+        decode_cfg.beam.beam_size = config.canary_beam_size  # 1 for greedy (fastest)
+        model.change_decoding_strategy(decode_cfg)
+        logger.info(f"✓ Greedy decoding configured (beam_size={config.canary_beam_size})")
+
+        # Enable streaming mode if available
         if hasattr(model, 'set_streaming_mode'):
             model.set_streaming_mode(True)
-            logger.info("✓ Streaming mode enabled via set_streaming_mode")
-
-        # Check if model has conformer_stream_step (this is the key API we need)
-        if hasattr(model, 'conformer_stream_step'):
-            logger.info("✓ conformer_stream_step API available - cache-aware processing active")
-        else:
-            logger.warning("⚠ conformer_stream_step not available - will use fallback transcription")
+            logger.info("✓ Streaming mode enabled")
 
         # Configure word boosting if available
         boost_file = Path(config.boost_words_file)
@@ -390,7 +463,8 @@ def load_nemo_model(config: Config) -> Optional[nemo_asr.models.ASRModel]:
             _configure_word_boosting(model, boost_file)
 
         model.eval()
-        logger.info(f"Model ready - Expected latency: ~80-160ms per chunk")
+        logger.info(f"Model ready - Expected latency: <50ms per chunk (1000+ RTFx)")
+        logger.info(f"Language: {config.canary_source_lang} → {config.canary_target_lang} | Task: {config.canary_task}")
         return model
 
     except Exception as e:

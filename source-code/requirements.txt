@@ -2,6 +2,7 @@
 # Production-ready dependencies with version pinning
 
 # Core ML/ASR
+# NeMo 2.1.0 supports Canary-1B Flash (requires >= r1.23.0)
 nemo_toolkit[asr]==2.1.0
 torch==2.5.1
 torchaudio>=2.6.0
