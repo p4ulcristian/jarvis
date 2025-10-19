@@ -104,6 +104,38 @@ class MicMonitor(Static):
         return content
 
 
+class KeyStatusWidget(Static):
+    """Widget to display keyboard hotkey status"""
+
+    ctrl_pressed = reactive(False)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.border_title = "⌨️ Hotkey Status"
+
+    def render(self) -> Text:
+        """Render the key status display with soft pastel colors"""
+        content = Text()
+
+        if self.ctrl_pressed:
+            # Ctrl is pressed - Type Mode ON
+            content.append("⌨️  Left Ctrl: ", style="#b8b8d0")
+            content.append("ON", style="bold #99ff99")
+            content.append(" ✓", style="#99ff99")
+            content.append("\n\n")
+            content.append("Type Mode ", style="#b8b8d0")
+            content.append("ACTIVE", style="bold #99ff99")
+        else:
+            # Ctrl is released - Type Mode OFF
+            content.append("⌨️  Left Ctrl: ", style="#b8b8d0")
+            content.append("OFF", style="#7888a0")
+            content.append("\n\n")
+            content.append("Type Mode ", style="#b8b8d0")
+            content.append("INACTIVE", style="#7888a0")
+
+        return content
+
+
 class JarvisApp(App):
     """Textual App for JARVIS Dashboard"""
 
@@ -116,8 +148,8 @@ class JarvisApp(App):
     CSS = """
     Screen {
         layout: grid;
-        grid-size: 5 4;
-        grid-rows: 3 1fr 1fr 1;
+        grid-size: 5 5;
+        grid-rows: 3 1fr 5 1fr 1;
         background: #1a1a2e;
     }
 
@@ -176,6 +208,7 @@ class JarvisApp(App):
 
     #transcription {
         column-span: 4;
+        row-span: 2;
         border: round #99ddbb;
         background: #1e1e2e;
         height: 100%;
@@ -184,6 +217,14 @@ class JarvisApp(App):
     #mic {
         column-span: 1;
         border: round #ddaadd;
+        background: #1e1e2e;
+        height: 100%;
+        padding: 1 2;
+    }
+
+    #key-status {
+        column-span: 1;
+        border: round #ffcc99;
         background: #1e1e2e;
         height: 100%;
         padding: 1 2;
@@ -252,6 +293,9 @@ class JarvisApp(App):
         # Mic monitor
         yield MicMonitor(id="mic")
 
+        # Key status widget (shows Ctrl key state)
+        yield KeyStatusWidget(id="key-status")
+
         # System logs (scrollable)
         system_log = RichLog(
             highlight=True,
@@ -277,7 +321,7 @@ class JarvisApp(App):
         sys_log.write("[#99ccff]⚡ System initialized[/#99ccff]")
 
     def check_keyboard_events(self) -> None:
-        """Check for keyboard events and handle Control key press"""
+        """Check for keyboard events and handle < key press/release"""
         try:
             import os
             if not os.path.exists(self.keyboard_event_file):
@@ -305,25 +349,41 @@ class JarvisApp(App):
                 if len(parts) >= 1:
                     key_name = parts[0]
 
-                    # Check for Control key press (various formats from different keyboard libraries)
-                    if key_name in ['ctrl_l', 'ctrl_r', 'ctrl', 'leftctrl', 'rightctrl', 'ENABLE_TYPE_MODE']:
-                        # Get the Type Mode button
-                        type_btn = self.query_one("#type-mode-btn", ToggleButton)
+                    # Get the Type Mode button and key status widget
+                    type_btn = self.query_one("#type-mode-btn", ToggleButton)
+                    key_status = self.query_one("#key-status", KeyStatusWidget)
+                    say_script = "/home/paul/Work/jarvis/source-code/services/say.sh"
 
-                        # Toggle Type Mode (enable if off, disable if on)
-                        type_btn.is_active = not type_btn.is_active
+                    # Check for Ctrl key press (enable Type Mode)
+                    if key_name == 'TYPE_MODE_ENABLE':
+                        # Enable Type Mode
+                        type_btn.is_active = True
                         type_btn.update_classes()
 
-                        # Update state in data bridge
-                        self.data_bridge.update_state(type_mode=type_btn.is_active)
+                        # Update key status widget
+                        key_status.ctrl_pressed = True
 
-                        say_script = "/home/paul/Work/jarvis/source-code/services/say.sh"
-                        if type_btn.is_active:
-                            subprocess.Popen([say_script, "type mode enabled"])
-                            self.data_bridge.send_log("INFO", "Type Mode: ON - Enabled by Control key press")
-                        else:
-                            subprocess.Popen([say_script, "type mode disabled"])
-                            self.data_bridge.send_log("INFO", "Type Mode: OFF - Disabled by Control key press")
+                        # Update state in data bridge
+                        self.data_bridge.update_state(type_mode=True)
+
+                        subprocess.Popen([say_script, "type mode enabled"])
+                        self.data_bridge.send_log("INFO", "Type Mode: ON - Left Ctrl pressed")
+
+                    # Check for Ctrl key release (disable Type Mode)
+                    elif key_name == 'TYPE_MODE_DISABLE':
+                        # Disable Type Mode
+                        type_btn.is_active = False
+                        type_btn.update_classes()
+
+                        # Update key status widget
+                        key_status.ctrl_pressed = False
+
+                        # Update state in data bridge
+                        self.data_bridge.update_state(type_mode=False)
+
+                        subprocess.Popen([say_script, "type mode disabled"])
+                        self.data_bridge.send_log("INFO", "Type Mode: OFF - Left Ctrl released")
+
         except Exception as e:
             # Silently ignore errors to not disrupt UI
             pass

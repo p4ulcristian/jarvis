@@ -53,6 +53,11 @@ def main():
     # Clear event file
     try:
         open(EVENT_FILE, 'w').close()
+
+        # Set permissions so any user can read/write (since we run as root)
+        import os
+        os.chmod(EVENT_FILE, 0o666)
+
         print(f"[INFO] Event file initialized: {EVENT_FILE}", file=sys.stderr)
     except Exception as e:
         print(f"[ERROR] Failed to initialize file: {e}", file=sys.stderr)
@@ -68,27 +73,42 @@ def main():
         sys.exit(1)
 
     print("[INFO] Listening for keyboard events... Press Ctrl+C to exit", file=sys.stderr)
+    print("[INFO] Hotkey: Hold LEFT CTRL to enable Type Mode, release to disable", file=sys.stderr)
+    print("[INFO] Debug mode: Logging all key presses", file=sys.stderr)
+
+    # Track left Ctrl key state for hold/release detection
+    ctrl_pressed = False
 
     # Listen for events
     try:
         for event in device.read_loop():
             if event.type == ecodes.EV_KEY:
                 key_event = categorize(event)
+                key_name = get_key_name(event.code)
 
-                # Only process key down events (not key up)
-                if key_event.keystate == 1:  # 1 = key down, 0 = key up, 2 = key hold
-                    key_name = get_key_name(event.code)
+                # Remove KEY_ prefix if present
+                if key_name.startswith('KEY_'):
+                    key_name = key_name[4:].lower()
 
-                    # Remove KEY_ prefix if present
-                    if key_name.startswith('KEY_'):
-                        key_name = key_name[4:].lower()
+                # DEBUG: Log all key presses for troubleshooting
+                timestamp = datetime.now().strftime('%H:%M:%S')
+                if key_event.keystate == 1:  # Key down
+                    print(f"[{timestamp}] {key_name} ↓ pressed", flush=True)
+                elif key_event.keystate == 0:  # Key up
+                    print(f"[{timestamp}] {key_name} ↑ released", flush=True)
 
-                    # Write event
-                    write_event(key_name)
-
-                    # Display in real-time with timestamp
-                    timestamp = datetime.now().strftime('%H:%M:%S')
-                    print(f"[{timestamp}] {key_name}", flush=True)
+                # Check for LEFT CTRL key (can appear as 'leftctrl' or 'ctrl_l')
+                if key_name in ['leftctrl', 'ctrl_l']:
+                    # Key down event
+                    if key_event.keystate == 1 and not ctrl_pressed:
+                        ctrl_pressed = True
+                        write_event('TYPE_MODE_ENABLE')
+                        print(f"[{timestamp}] >>> LEFT CTRL pressed - Type Mode ENABLED <<<", flush=True)
+                    # Key up event
+                    elif key_event.keystate == 0 and ctrl_pressed:
+                        ctrl_pressed = False
+                        write_event('TYPE_MODE_DISABLE')
+                        print(f"[{timestamp}] >>> LEFT CTRL released - Type Mode DISABLED <<<", flush=True)
 
     except KeyboardInterrupt:
         print("\n[INFO] Keyboard listener stopped", file=sys.stderr)

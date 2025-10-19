@@ -1,4 +1,4 @@
-#!/home/paul/Work/jarvis/venv/bin/python
+#!/usr/bin/env python3
 """
 JARVIS - Voice-to-Text System with Streaming NeMo ASR
 Production-ready refactored version with modular architecture
@@ -7,6 +7,7 @@ import os
 import sys
 import signal
 import threading
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -324,11 +325,118 @@ class Jarvis:
 # Global references for cleanup
 _ui_instance = None
 _jarvis_instance = None
+_keyboard_listener_process = None
+
+
+def start_keyboard_listener():
+    """Start the keyboard listener with sudo privileges"""
+    global _keyboard_listener_process
+
+    try:
+        # Path to keyboard listener script
+        script_dir = Path(__file__).parent
+        listener_script = script_dir / "services" / "keyboard_listener.py"
+
+        if not listener_script.exists():
+            print(f"Warning: Keyboard listener not found at {listener_script}", file=sys.stderr)
+            return None
+
+        # Use the same Python interpreter from venv
+        python_exe = sys.executable
+
+        print("\n" + "="*60)
+        print("JARVIS - Keyboard Hotkey Setup")
+        print("="*60)
+        print("Keyboard listener requires sudo access.")
+        print("You may be prompted for your password.")
+        print("="*60 + "\n")
+
+        import time
+
+        # First, prompt for sudo password using sudo -v
+        # This will cache the credentials for the actual listener command
+        print("Requesting sudo access...")
+        try:
+            result = subprocess.run(['sudo', '-v'], check=True)
+        except subprocess.CalledProcessError:
+            print("❌ Failed to get sudo access", file=sys.stderr)
+            return None
+
+        print("✓ Sudo access granted\n")
+
+        # Clean up old event file (may be owned by root from previous run)
+        event_file = "/tmp/jarvis-keyboard-events"
+        try:
+            subprocess.run(['sudo', 'rm', '-f', event_file], check=False)
+        except Exception:
+            pass  # Ignore errors if file doesn't exist
+
+        # Now start the keyboard listener (uses cached sudo credentials)
+        print("Starting keyboard listener...")
+        _keyboard_listener_process = subprocess.Popen(
+            ['sudo', '-E', python_exe, str(listener_script)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+        # Wait for listener to initialize
+        time.sleep(1.0)
+
+        if _keyboard_listener_process.poll() is not None:
+            # Process already exited, something went wrong
+            stdout, stderr = _keyboard_listener_process.communicate()
+            print(f"\n❌ Error: Keyboard listener failed to start", file=sys.stderr)
+            if stderr:
+                print(f"    Error: {stderr}", file=sys.stderr)
+            _keyboard_listener_process = None
+            return None
+
+        print("✅ Keyboard listener running!")
+        print("   Hotkey: Hold LEFT CTRL to enable Type Mode, release to disable")
+        print("\n🚀 Starting JARVIS UI...\n")
+        time.sleep(1.5)
+
+        return _keyboard_listener_process
+
+    except FileNotFoundError:
+        print("Error: 'sudo' command not found. Install sudo or run as root.", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"Error starting keyboard listener: {e}", file=sys.stderr)
+        return None
+
+
+def stop_keyboard_listener():
+    """Stop the keyboard listener process"""
+    global _keyboard_listener_process
+
+    if _keyboard_listener_process:
+        try:
+            # Try graceful termination first
+            _keyboard_listener_process.terminate()
+
+            # Wait up to 2 seconds for graceful shutdown
+            try:
+                _keyboard_listener_process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                # Force kill if it doesn't stop
+                _keyboard_listener_process.kill()
+                _keyboard_listener_process.wait()
+
+            print("Keyboard listener stopped")
+        except Exception as e:
+            print(f"Error stopping keyboard listener: {e}", file=sys.stderr)
+        finally:
+            _keyboard_listener_process = None
 
 
 def shutdown_all():
     """Shutdown both JARVIS and UI"""
     global _ui_instance, _jarvis_instance
+
+    # Stop keyboard listener
+    stop_keyboard_listener()
 
     # Stop JARVIS
     if _jarvis_instance:
@@ -377,6 +485,9 @@ def main():
 
     # Set up signal handler
     signal.signal(signal.SIGINT, signal_handler)
+
+    # Start keyboard listener with sudo (asks for password early)
+    start_keyboard_listener()
 
     try:
         # START UI IMMEDIATELY - before ANY heavy imports
@@ -446,6 +557,7 @@ def main():
         return 1
     finally:
         # Ensure cleanup even on errors
+        stop_keyboard_listener()
         if _ui_instance:
             _ui_instance.stop()
         if _jarvis_instance:
