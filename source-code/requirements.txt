@@ -16,6 +16,7 @@ wave; python_version >= "3.0"
 # Keyboard & Typing
 pynput==1.7.7
 evdev==1.7.1  # For Wayland-compatible keyboard automation
+pyperclip==1.9.0  # For clipboard-based text insertion
 
 # Configuration & Environment
 python-dotenv==1.0.1

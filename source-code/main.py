@@ -157,11 +157,44 @@ class Jarvis:
 
         try:
             iteration = 0
+            last_ptt_state = False  # Track PTT state changes
+            ptt_transcriptions = []  # Buffer transcriptions during PTT hold
+
             while not self.shutdown:
                 try:
                     iteration += 1
 
-                    # Capture audio chunk
+                    # Check PTT state for typing control
+                    ptt_active = False
+                    if self.data_bridge:
+                        state = self.data_bridge.get_state()
+                        ptt_active = state.ptt_active
+
+                    # Detect PTT state changes
+                    ptt_pressed = not last_ptt_state and ptt_active
+                    ptt_released = last_ptt_state and not ptt_active
+                    last_ptt_state = ptt_active
+
+                    # When PTT is pressed, clear the transcription buffer
+                    if ptt_pressed:
+                        ptt_transcriptions = []
+                        if self.data_bridge:
+                            self.data_bridge.send_log("INFO", "Type Mode: Hold to record, release to type")
+
+                    # When PTT is released, type all transcriptions from this session
+                    if ptt_released and ptt_transcriptions:
+                        combined_text = " ".join(ptt_transcriptions)
+                        if self.keyboard_typer:
+                            try:
+                                self.keyboard_typer.paste_text(combined_text)
+                                self.logger.debug(f"Auto-typed: {combined_text}")
+                                if self.data_bridge:
+                                    self.data_bridge.send_log("INFO", f"Typed: {combined_text[:50]}...")
+                            except Exception as e:
+                                self.logger.error(f"Failed to auto-type text: {e}", exc_info=True)
+                        ptt_transcriptions = []
+
+                    # ALWAYS capture and process audio (continuous transcription)
                     audio_chunk = self.audio_capture.capture_chunk()
                     if audio_chunk is None:
                         continue
@@ -185,6 +218,7 @@ class Jarvis:
                                 f"- max: {max_amp:.0f}"
                             )
                     else:
+                        # Continuous transcription mode
                         # Check if chunk has speech
                         has_speech = self.frame_asr.has_speech(audio_chunk, debug=False)
 
@@ -192,12 +226,7 @@ class Jarvis:
                             # Add speech to buffer
                             self.frame_asr.add_speech_chunk(audio_chunk)
                         else:
-                            # Increment silence counter
-                            self.frame_asr.silence_count += 1
-
-                        # Check if we should transcribe accumulated audio
-                        if self.frame_asr.should_transcribe():
-                            # Get buffered audio
+                            # Silence detected - transcribe accumulated audio
                             buffered_audio = self.frame_asr.get_buffered_audio()
 
                             if len(buffered_audio) > 0:
@@ -209,40 +238,22 @@ class Jarvis:
                                 if self.data_bridge:
                                     self.data_bridge.update_state(processing=False)
 
-                                self.logger.debug(f"Transcription result: '{text}' (empty={not text})")
-                            else:
-                                text = ""
+                                # Process transcription (always log and display)
+                                if text:
+                                    self.log_conversation(text)
+                                    self.transcription_buffer.add(text)
 
-                        else:
-                            # Not ready to transcribe yet
-                            continue
+                                    # Always send to UI
+                                    if self.data_bridge:
+                                        self.data_bridge.send_transcription(text)
 
-                        # Only log/display non-empty transcriptions
-                        if text:
-                            # Log to file
-                            self.log_conversation(text)
+                                    # If PTT is active, buffer for typing when released
+                                    if ptt_active:
+                                        ptt_transcriptions.append(text)
 
-                            # Add to buffer
-                            self.transcription_buffer.add(text)
-
-                            # Send to UI
-                            if self.data_bridge:
-                                self.data_bridge.send_transcription(text)
-
-                            # Check if Type Mode is active and type the text
-                            if self.data_bridge and self.keyboard_typer:
-                                state = self.data_bridge.get_state()
-                                if state.type_mode:
-                                    try:
-                                        self.keyboard_typer.type_text(text)
-                                        self.logger.debug(f"Typed: {text}")
-                                    except Exception as e:
-                                        self.logger.error(f"Failed to type text: {e}")
-
-                            # Display (only if no UI)
-                            if not self.config.enable_ui:
-                                timestamp = datetime.now().strftime('%H:%M:%S')
-                                self.logger.info(f"[{timestamp}] {text}")
+                                    if not self.config.enable_ui:
+                                        timestamp = datetime.now().strftime('%H:%M:%S')
+                                        self.logger.info(f"[{timestamp}] {text}")
 
                 except KeyboardInterrupt:
                     raise
@@ -393,7 +404,7 @@ def start_keyboard_listener():
             return None
 
         print("✅ Keyboard listener running!")
-        print("   Hotkey: Hold LEFT CTRL to enable Type Mode, release to disable")
+        print("   Hotkey: Hold LEFT CTRL to enable Type Mode (auto-type transcriptions)")
         print("\n🚀 Starting JARVIS UI...\n")
         time.sleep(1.5)
 

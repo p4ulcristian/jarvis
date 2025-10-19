@@ -40,6 +40,7 @@ class SystemState:
     mic_active: bool
     processing: bool
     type_mode: bool
+    ptt_active: bool  # Push-to-talk active state
     error: Optional[str]
 
 
@@ -68,6 +69,7 @@ class DataBridge:
             mic_active=False,
             processing=False,
             type_mode=False,
+            ptt_active=False,
             error=None
         )
 
@@ -197,6 +199,7 @@ class DataBridge:
                 mic_active=self._state.mic_active,
                 processing=self._state.processing,
                 type_mode=self._state.type_mode,
+                ptt_active=self._state.ptt_active,
                 error=self._state.error
             )
 

@@ -2,7 +2,12 @@
 """
 JARVIS Terminal UI
 Interactive dashboard using Textual framework with scrollable elements
-Soft pastel color theme - easy on the eyes
+Pip-Boy inspired green monochrome theme - retro-futuristic CRT aesthetic
+
+Text Selection:
+  - In most terminals: Hold Shift while dragging mouse to select text
+  - Export logs: Press 'e' to export all logs to ~/jarvis_exports/
+  - Terminal-specific: Some terminals may use different modifiers (Alt, Ctrl+Shift)
 """
 
 import asyncio
@@ -51,55 +56,57 @@ class MicMonitor(Static):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.border_title = "Microphone"
+        self.border_title = "[MIC] Audio Input"
 
     def render(self) -> Text:
-        """Render the mic level display with soft pastel colors"""
+        """Render the mic level display as compact Pip-Boy style vertical bar meter"""
         level = self.level
 
-        # Create visual bar with smooth gradient effect
-        bar_length = 40
-        filled = int((level / 100) * bar_length)
+        # Compact vertical bar meter (5 segments)
+        segments = 5
+        filled_segments = int((level / 100) * segments)
 
-        # Use different characters for smoother visual
-        bar_chars = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
-        filled_bar = "".join([bar_chars[min(7, int((i / bar_length) * 8))] for i in range(filled)])
-        empty_bar = "░" * (bar_length - filled)
-        bar = filled_bar + empty_bar
-
-        # Soft pastel colors based on level
-        if level > 70:
-            color = "#ff9999"  # pastel red
-            status_text = "LOUD"
-            status_color = "#ff9999"
-            icon = "🔊"
-        elif level > 40:
-            color = "#ffcc99"  # pastel orange
-            status_text = "ACTIVE"
-            status_color = "#ffcc99"
-            icon = "🎤"
-        elif level > 10:
-            color = "#99ff99"  # pastel green
-            status_text = "SPEAKING"
-            status_color = "#99ff99"
-            icon = "💬"
-        else:
-            color = "#ccccdd"  # soft gray
-            status_text = "QUIET"
-            status_color = "#9999cc"
-            icon = "🔇"
-
+        # Build vertical meter from top to bottom
         content = Text()
-        content.append(f"{icon} ", style="")
-        content.append(bar, style=color)
-        content.append("\n\n")
-        content.append(f"Level: ", style="#b8b8d0")
-        content.append(f"{level:.0f}%", style=color)
-        content.append(f"  │  ", style="#b8b8d0")
-        content.append(f"Peak: ", style="#b8b8d0")
-        content.append(f"{self.peak:.0f}%", style="#ccccdd")
-        content.append(f"\n\n")
-        content.append(f"{status_text}", style=status_color)
+
+        # Green monochrome colors based on level (amber for warnings)
+        if level > 70:
+            bar_color = "#ffaa00"  # amber warning
+            status_text = "LOUD"
+            status_color = "#ffaa00"
+            icon = "[!]"
+        elif level > 40:
+            bar_color = "#00ff00"  # bright green
+            status_text = "ACTV"
+            status_color = "#00ff00"
+            icon = "[*]"
+        elif level > 10:
+            bar_color = "#33ff33"  # lighter green
+            status_text = "TALK"
+            status_color = "#33ff33"
+            icon = "[>]"
+        else:
+            bar_color = "#226622"  # dim green
+            status_text = "IDLE"
+            status_color = "#226622"
+            icon = "[-]"
+
+        # Draw compact vertical bars (from top to bottom)
+        for i in range(segments, 0, -1):
+            if i <= filled_segments:
+                # Filled segment
+                if i > 3:
+                    content.append("█████ ", style=bar_color)
+                else:
+                    content.append("█████ ", style="#00ff00")
+                content.append(f"{i*20}%\n", style="#226622")
+            else:
+                # Empty segment
+                content.append("▒▒▒▒▒ ", style="#226622")
+                content.append(f"{i*20}%\n", style="#226622")
+
+        content.append(f"{icon} {status_text} ", style=status_color)
+        content.append(f"P:{self.peak:.0f}%", style="#226622")
 
         return content
 
@@ -107,31 +114,23 @@ class MicMonitor(Static):
 class KeyStatusWidget(Static):
     """Widget to display keyboard hotkey status"""
 
-    ctrl_pressed = reactive(False)
+    ptt_active = reactive(False)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.border_title = "⌨️ Hotkey Status"
+        self.border_title = "[Type Mode] Status"
 
     def render(self) -> Text:
-        """Render the key status display with soft pastel colors"""
+        """Render compact PTT status display"""
         content = Text()
 
-        if self.ctrl_pressed:
-            # Ctrl is pressed - Type Mode ON
-            content.append("⌨️  Left Ctrl: ", style="#b8b8d0")
-            content.append("ON", style="bold #99ff99")
-            content.append(" ✓", style="#99ff99")
-            content.append("\n\n")
-            content.append("Type Mode ", style="#b8b8d0")
-            content.append("ACTIVE", style="bold #99ff99")
+        # Compact Type mode status
+        content.append("Type mode: ", style="#33ff33")
+        if self.ptt_active:
+            content.append("ON", style="bold #00ff00")
+            content.append(" ●", style="#00ff00")
         else:
-            # Ctrl is released - Type Mode OFF
-            content.append("⌨️  Left Ctrl: ", style="#b8b8d0")
-            content.append("OFF", style="#7888a0")
-            content.append("\n\n")
-            content.append("Type Mode ", style="#b8b8d0")
-            content.append("INACTIVE", style="#7888a0")
+            content.append("OFF", style="#226622")
 
         return content
 
@@ -143,31 +142,33 @@ class JarvisApp(App):
     # Note: Ctrl key alone is handled by keyboard_listener.py
     BINDINGS = [
         ("ctrl+c", "quit", "Quit"),
+        ("e", "export_logs", "Export Logs"),
     ]
 
     CSS = """
     Screen {
         layout: grid;
         grid-size: 5 5;
-        grid-rows: 3 1fr 5 1fr 1;
-        background: #1a1a2e;
+        grid-rows: 2 1fr 3 1fr 1;
+        background: #0a0e0a;
     }
 
     #header {
         column-span: 5;
-        height: 3;
+        height: 2;
         layout: horizontal;
-        background: #2d2d44;
-        border: round #b8b8ff;
+        background: #0d1409;
+        border: heavy #00ff00;
     }
 
     #title {
         width: 1fr;
         content-align: center middle;
         text-style: bold;
-        color: #b8b8ff;
-        background: #2d2d44;
+        color: #00ff00;
+        background: #0d1409;
         text-align: center;
+        text-opacity: 95%;
     }
 
     #button-bar {
@@ -184,69 +185,74 @@ class JarvisApp(App):
     }
 
     ToggleButton.passive {
-        background: #3d3d54;
-        color: #7888a0;
+        background: #0d1409;
+        color: #226622;
         border: none;
     }
 
     ToggleButton.passive:hover {
-        background: #4d4d64;
-        color: #8898b0;
+        background: #162812;
+        color: #338833;
     }
 
     ToggleButton.active {
-        background: #99ddbb;
-        color: #1a1a2e;
+        background: #00ff00;
+        color: #000000;
         text-style: bold;
         border: none;
     }
 
     ToggleButton.active:hover {
-        background: #aaeedd;
-        color: #1a1a2e;
+        background: #33ff33;
+        color: #000000;
     }
 
     #transcription {
         column-span: 4;
         row-span: 2;
-        border: round #99ddbb;
-        background: #1e1e2e;
+        border: heavy #00ff00;
+        border-title-color: #33ff33;
+        border-subtitle-color: #226622;
+        background: #0d1409;
         height: 100%;
     }
 
     #mic {
         column-span: 1;
-        border: round #ddaadd;
-        background: #1e1e2e;
+        border: heavy #00ff00;
+        border-title-color: #33ff33;
+        background: #0d1409;
         height: 100%;
-        padding: 1 2;
+        padding: 1;
     }
 
     #key-status {
         column-span: 1;
-        border: round #ffcc99;
-        background: #1e1e2e;
+        border: heavy #00ff00;
+        border-title-color: #33ff33;
+        background: #0d1409;
         height: 100%;
-        padding: 1 2;
+        padding: 1;
     }
 
     #logs {
         column-span: 5;
-        border: round #99ccff;
-        background: #1e1e2e;
+        border: heavy #00ff00;
+        border-title-color: #33ff33;
+        background: #0d1409;
         height: 100%;
     }
 
     Footer {
         column-span: 5;
-        background: #2d2d44;
-        color: #b8b8d0;
+        background: #0d1409;
+        color: #33ff33;
     }
 
     RichLog {
         scrollbar-gutter: stable;
-        scrollbar-background: #2d2d44;
-        scrollbar-color: #b8b8ff;
+        scrollbar-background: #0d1409;
+        scrollbar-color: #00ff00;
     }
     """
 
@@ -268,17 +274,9 @@ class JarvisApp(App):
 
     def compose(self) -> ComposeResult:
         """Create child widgets"""
-        # Header with title and buttons
+        # Header with title
         with Container(id="header"):
-            yield Static("✨ J · A · R · V · I · S ✨", id="title")
-            with Horizontal(id="button-bar"):
-                type_btn = ToggleButton("Type Mode", id="type-mode-btn")
-                type_btn.add_class("passive")
-                yield type_btn
-
-                chat_btn = ToggleButton("Chat Mode", id="chat-mode-btn")
-                chat_btn.add_class("passive")
-                yield chat_btn
+            yield Static("[:: J A R V I S ::]", id="title")
 
         # Transcription log (scrollable)
         transcription_log = RichLog(
@@ -286,8 +284,8 @@ class JarvisApp(App):
             markup=True,
             id="transcription"
         )
-        transcription_log.border_title = "💬 Transcription"
-        transcription_log.border_subtitle = "scroll: ↑↓ pgup/pgdn"
+        transcription_log.border_title = "[>>] Transcription"
+        transcription_log.border_subtitle = "scroll: ↑↓ pgup/pgdn | export: e | select: shift+mouse"
         yield transcription_log
 
         # Mic monitor
@@ -302,7 +300,8 @@ class JarvisApp(App):
             markup=True,
             id="logs"
         )
-        system_log.border_title = "📋 System Logs"
+        system_log.border_title = "[==] System Logs"
+        system_log.border_subtitle = "export: e | select: shift+mouse"
         yield system_log
 
         # Footer
@@ -313,12 +312,12 @@ class JarvisApp(App):
         # Start the data update loop
         self.set_interval(1.0 / self.refresh_rate, self.update_data)
 
-        # Add initial messages with soft colors
+        # Add initial messages with Pip-Boy green colors
         trans_log = self.query_one("#transcription", RichLog)
-        trans_log.write("[#b8b8d0]✨ Ready to listen...[/#b8b8d0]")
+        trans_log.write("[#33ff33][>>] Ready to listen...[/#33ff33]")
 
         sys_log = self.query_one("#logs", RichLog)
-        sys_log.write("[#99ccff]⚡ System initialized[/#99ccff]")
+        sys_log.write("[#00ff00][==] System initialized[/#00ff00]")
 
     def check_keyboard_events(self) -> None:
         """Check for keyboard events and handle < key press/release"""
@@ -349,103 +348,98 @@ class JarvisApp(App):
                 if len(parts) >= 1:
                     key_name = parts[0]
 
-                    # Get the Type Mode button and key status widget
-                    type_btn = self.query_one("#type-mode-btn", ToggleButton)
+                    # Get the key status widget
                     key_status = self.query_one("#key-status", KeyStatusWidget)
-                    say_script = "/home/paul/Work/jarvis/source-code/services/say.sh"
 
-                    # Check for Ctrl key press (enable Type Mode)
-                    if key_name == 'TYPE_MODE_ENABLE':
-                        # Enable Type Mode
-                        type_btn.is_active = True
-                        type_btn.update_classes()
-
+                    # Check for Push-to-Talk start
+                    if key_name == 'PTT_START':
                         # Update key status widget
-                        key_status.ctrl_pressed = True
+                        key_status.ptt_active = True
 
                         # Update state in data bridge
-                        self.data_bridge.update_state(type_mode=True)
+                        self.data_bridge.update_state(ptt_active=True)
+                        self.data_bridge.send_log("INFO", "⌨️  Type Mode Active (transcriptions will be typed on release)")
 
-                        subprocess.Popen([say_script, "type mode enabled"])
-                        self.data_bridge.send_log("INFO", "Type Mode: ON - Left Ctrl pressed")
-
-                    # Check for Ctrl key release (disable Type Mode)
-                    elif key_name == 'TYPE_MODE_DISABLE':
-                        # Disable Type Mode
-                        type_btn.is_active = False
-                        type_btn.update_classes()
-
+                    # Check for Push-to-Talk stop (transcribe and type)
+                    elif key_name == 'PTT_STOP':
                         # Update key status widget
-                        key_status.ctrl_pressed = False
+                        key_status.ptt_active = False
 
                         # Update state in data bridge
-                        self.data_bridge.update_state(type_mode=False)
+                        self.data_bridge.update_state(ptt_active=False)
+                        self.data_bridge.send_log("INFO", "⏸️  Type Mode: Typing transcription...")
 
-                        subprocess.Popen([say_script, "type mode disabled"])
-                        self.data_bridge.send_log("INFO", "Type Mode: OFF - Left Ctrl released")
+                    # Check for Push-to-Talk cancel (Ctrl+key combo)
+                    elif key_name == 'PTT_CANCEL':
+                        # Update key status widget
+                        key_status.ptt_active = False
+
+                        # Update state in data bridge
+                        self.data_bridge.update_state(ptt_active=False)
+                        self.data_bridge.send_log("INFO", "❌ Type Mode cancelled (keyboard combo detected)")
+
 
         except Exception as e:
             # Silently ignore errors to not disrupt UI
             pass
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        """Handle button presses"""
-        button = event.button
-
-        if isinstance(button, ToggleButton):
-            button.toggle()
-
-            say_script = "/home/paul/Work/jarvis/source-code/services/say.sh"
-
-            if button.id == "type-mode-btn":
-                # Update state in data bridge
-                self.data_bridge.update_state(type_mode=button.is_active)
-
-                if button.is_active:
-                    subprocess.Popen([say_script, "type mode enabled"])
-                    self.data_bridge.send_log("INFO", "Type Mode: ON - Transcriptions will be typed automatically")
-                else:
-                    subprocess.Popen([say_script, "type mode disabled"])
-                    self.data_bridge.send_log("INFO", "Type Mode: OFF")
-
-            elif button.id == "chat-mode-btn":
-                if button.is_active:
-                    subprocess.Popen([say_script, "chat mode enabled"])
-                else:
-                    subprocess.Popen([say_script, "chat mode disabled"])
+        """Handle button presses (currently no buttons in UI)"""
+        pass
 
     def action_toggle_type_mode(self) -> None:
-        """Action to toggle Type Mode via keyboard"""
-        try:
-            type_btn = self.query_one("#type-mode-btn", ToggleButton)
-            type_btn.toggle()
-
-            # Update state in data bridge
-            self.data_bridge.update_state(type_mode=type_btn.is_active)
-
-            say_script = "/home/paul/Work/jarvis/source-code/services/say.sh"
-            if type_btn.is_active:
-                subprocess.Popen([say_script, "type mode enabled"])
-                self.data_bridge.send_log("INFO", "Type Mode: ON - Transcriptions will be typed automatically")
-            else:
-                subprocess.Popen([say_script, "type mode disabled"])
-                self.data_bridge.send_log("INFO", "Type Mode: OFF")
-        except Exception as e:
-            self.data_bridge.send_log("ERROR", f"Failed to toggle Type Mode: {e}")
+        """Action to toggle Type Mode via keyboard (deprecated - PTT is always auto-type)"""
+        pass
 
     def action_toggle_chat_mode(self) -> None:
-        """Action to toggle Chat Mode via keyboard"""
-        try:
-            chat_btn = self.query_one("#chat-mode-btn", ToggleButton)
-            chat_btn.toggle()
+        """Action to toggle Chat Mode via keyboard (deprecated)"""
+        pass
 
-            say_script = "/home/paul/Work/jarvis/source-code/services/say.sh"
-            if chat_btn.is_active:
-                subprocess.Popen([say_script, "chat mode enabled"])
-            else:
-                subprocess.Popen([say_script, "chat mode disabled"])
+    def action_export_logs(self) -> None:
+        """Export transcriptions and system logs to a file"""
+        import os
+
+        # Create exports directory if it doesn't exist
+        export_dir = os.path.expanduser("~/jarvis_exports")
+        os.makedirs(export_dir, exist_ok=True)
+
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        export_file = os.path.join(export_dir, f"jarvis_logs_{timestamp}.txt")
+
+        try:
+            # Get the log widgets
+            trans_log = self.query_one("#transcription", RichLog)
+            sys_log = self.query_one("#logs", RichLog)
+
+            with open(export_file, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write("JARVIS EXPORT\n")
+                f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("=" * 80 + "\n\n")
+
+                # Export transcriptions
+                f.write("TRANSCRIPTIONS\n")
+                f.write("-" * 80 + "\n")
+                # Get text content from RichLog
+                for line in trans_log.lines:
+                    # Convert Rich text to plain text
+                    f.write(line.text + "\n")
+                f.write("\n\n")
+
+                # Export system logs
+                f.write("SYSTEM LOGS\n")
+                f.write("-" * 80 + "\n")
+                for line in sys_log.lines:
+                    # Convert Rich text to plain text
+                    f.write(line.text + "\n")
+
+            # Show success message in system log
+            self.data_bridge.send_log("INFO", f"Logs exported to: {export_file}")
+
         except Exception as e:
-            self.data_bridge.send_log("ERROR", f"Failed to toggle Chat Mode: {e}")
+            # Show error message
+            self.data_bridge.send_log("ERROR", f"Export failed: {str(e)}")
 
     def update_data(self) -> None:
         """Update UI from data bridge (called periodically)"""
@@ -477,11 +471,11 @@ class JarvisApp(App):
                 break
 
             timestamp = trans.timestamp.strftime("%H:%M:%S")
-            trans_log.write(f"[#99ddbb][{timestamp}][/#99ddbb] [#e0e0e0]{trans.text}[/#e0e0e0]")
+            trans_log.write(f"[#33ff33][{timestamp}][/#33ff33] [#00ff00]{trans.text}[/#00ff00]")
             self.transcription_count += 1
 
             # Update border title with count
-            trans_log.border_title = f"💬 Transcription ({self.transcription_count})"
+            trans_log.border_title = f"[>>] Transcription ({self.transcription_count})"
 
         # Get system log widget
         sys_log = self.query_one("#logs", RichLog)
@@ -492,29 +486,29 @@ class JarvisApp(App):
             if log is None:
                 break
 
-            # Format log with soft pastel colors based on level
+            # Format log with Pip-Boy green monochrome (amber for warnings/errors)
             timestamp = log.timestamp.strftime("%H:%M:%S")
             level_colors = {
-                "DEBUG": "#b8b8d0",
-                "INFO": "#99ccff",
-                "WARNING": "#ffcc99",
-                "ERROR": "#ff9999",
-                "CRITICAL": "#ff9999"
+                "DEBUG": "#226622",
+                "INFO": "#00ff00",
+                "WARNING": "#ffaa00",
+                "ERROR": "#ffaa00",
+                "CRITICAL": "#ff6600"
             }
             level_icons = {
-                "DEBUG": "🔍",
-                "INFO": "ℹ️",
-                "WARNING": "⚠️",
-                "ERROR": "❌",
-                "CRITICAL": "🔥"
+                "DEBUG": "[?]",
+                "INFO": "[i]",
+                "WARNING": "[!]",
+                "ERROR": "[X]",
+                "CRITICAL": "[!!]"
             }
-            color = level_colors.get(log.level, "#e0e0e0")
-            icon = level_icons.get(log.level, "•")
+            color = level_colors.get(log.level, "#33ff33")
+            icon = level_icons.get(log.level, "[·]")
             sys_log.write(f"[{color}]{icon} [{timestamp}] {log.level}: {log.message}[/{color}]")
             self.log_count += 1
 
             # Update border title with count
-            sys_log.border_title = f"📋 System Logs ({self.log_count})"
+            sys_log.border_title = f"[==] System Logs ({self.log_count})"
 
         # Check for keyboard events (Control key to enable Type Mode)
         self.check_keyboard_events()

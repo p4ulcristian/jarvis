@@ -10,6 +10,13 @@ from evdev import UInput, ecodes as e
 
 logger = logging.getLogger(__name__)
 
+try:
+    import pyperclip
+    PYPERCLIP_AVAILABLE = True
+except ImportError:
+    PYPERCLIP_AVAILABLE = False
+    logger.warning("pyperclip not available - paste_text() will use type_text() fallback")
+
 
 # Key mapping: character -> evdev keycode
 # This maps common ASCII characters to Linux input event codes
@@ -130,21 +137,29 @@ class KeyboardTyper:
             logger.error(f"Failed to initialize virtual keyboard: {err}")
             return False
 
-    def type_text(self, text: str) -> bool:
+    def type_text(self, text: str, delay_before_typing: float = 0.0) -> bool:
         """
         Type the given text using the virtual keyboard
 
         Args:
             text: Text to type
+            delay_before_typing: Delay in seconds before starting to type (default: 0.0)
 
         Returns:
             True if successful, False otherwise
         """
         if not self._initialized:
             if not self.initialize():
+                logger.error("Failed to initialize keyboard before typing")
                 return False
 
         try:
+            # Optional delay to allow window focus
+            if delay_before_typing > 0:
+                logger.debug(f"Waiting {delay_before_typing}s before typing...")
+                time.sleep(delay_before_typing)
+
+            logger.debug(f"Typing text: {text}")
             for char in text:
                 self._type_char(char)
                 time.sleep(self.typing_delay)
@@ -152,11 +167,69 @@ class KeyboardTyper:
             # Add a space at the end for natural flow
             self._type_char(' ')
 
+            logger.info(f"Successfully typed text: {text}")
             return True
 
         except Exception as err:
-            logger.error(f"Failed to type text: {err}")
+            logger.error(f"Failed to type text: {err}", exc_info=True)
             return False
+
+    def paste_text(self, text: str, delay_before_paste: float = 0.0) -> bool:
+        """
+        Insert text instantly by copying to clipboard and simulating Ctrl+V
+
+        Args:
+            text: Text to paste
+            delay_before_paste: Delay in seconds before pasting (default: 0.0)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not PYPERCLIP_AVAILABLE:
+            logger.warning("pyperclip not available, falling back to type_text()")
+            return self.type_text(text, delay_before_typing=delay_before_paste)
+
+        if not self._initialized:
+            if not self.initialize():
+                logger.error("Failed to initialize keyboard before pasting")
+                return False
+
+        try:
+            # Optional delay to allow window focus
+            if delay_before_paste > 0:
+                logger.debug(f"Waiting {delay_before_paste}s before pasting...")
+                time.sleep(delay_before_paste)
+
+            # Add a space at the end for natural flow
+            text_with_space = text + ' '
+
+            # Copy text to clipboard
+            logger.debug(f"Copying to clipboard: {text}")
+            pyperclip.copy(text_with_space)
+
+            # Longer delay to ensure clipboard is updated (especially on Wayland)
+            time.sleep(0.05)
+
+            # Simulate Ctrl+V
+            logger.debug("Simulating Ctrl+V")
+            self.ui.write(e.EV_KEY, e.KEY_LEFTCTRL, 1)  # Ctrl down
+            self.ui.syn()
+            time.sleep(0.01)  # Small delay between Ctrl and V
+            self.ui.write(e.EV_KEY, e.KEY_V, 1)  # V down
+            self.ui.syn()
+            self.ui.write(e.EV_KEY, e.KEY_V, 0)  # V up
+            self.ui.syn()
+            self.ui.write(e.EV_KEY, e.KEY_LEFTCTRL, 0)  # Ctrl up
+            self.ui.syn()
+
+            logger.info(f"Successfully pasted text via clipboard: {text}")
+            return True
+
+        except Exception as err:
+            logger.error(f"Failed to paste text: {err}", exc_info=True)
+            # Try fallback to typing
+            logger.warning("Attempting fallback to type_text()")
+            return self.type_text(text, delay_before_typing=delay_before_paste)
 
     def _type_char(self, char: str) -> None:
         """

@@ -73,11 +73,12 @@ def main():
         sys.exit(1)
 
     print("[INFO] Listening for keyboard events... Press Ctrl+C to exit", file=sys.stderr)
-    print("[INFO] Hotkey: Hold LEFT CTRL to enable Type Mode, release to disable", file=sys.stderr)
+    print("[INFO] Hotkey: Hold LEFT CTRL to enable Type Mode (auto-type transcriptions)", file=sys.stderr)
     print("[INFO] Debug mode: Logging all key presses", file=sys.stderr)
 
-    # Track left Ctrl key state for hold/release detection
-    ctrl_pressed = False
+    # Track left Ctrl key state for push-to-talk
+    left_ctrl_pressed = False
+    other_key_pressed_during_left_ctrl = False
 
     # Listen for events
     try:
@@ -99,16 +100,30 @@ def main():
 
                 # Check for LEFT CTRL key (can appear as 'leftctrl' or 'ctrl_l')
                 if key_name in ['leftctrl', 'ctrl_l']:
-                    # Key down event
-                    if key_event.keystate == 1 and not ctrl_pressed:
-                        ctrl_pressed = True
-                        write_event('TYPE_MODE_ENABLE')
-                        print(f"[{timestamp}] >>> LEFT CTRL pressed - Type Mode ENABLED <<<", flush=True)
-                    # Key up event
-                    elif key_event.keystate == 0 and ctrl_pressed:
-                        ctrl_pressed = False
-                        write_event('TYPE_MODE_DISABLE')
-                        print(f"[{timestamp}] >>> LEFT CTRL released - Type Mode DISABLED <<<", flush=True)
+                    # Key down event - start PTT
+                    if key_event.keystate == 1 and not left_ctrl_pressed:
+                        left_ctrl_pressed = True
+                        other_key_pressed_during_left_ctrl = False
+                        # Only start PTT if no other keys are pressed
+                        write_event('PTT_START')
+                        print(f"[{timestamp}] >>> LEFT CTRL pressed - Type Mode ACTIVE <<<", flush=True)
+                    # Key up event - stop PTT
+                    elif key_event.keystate == 0 and left_ctrl_pressed:
+                        left_ctrl_pressed = False
+                        # Only type if no other keys were pressed (not a keyboard combo)
+                        if not other_key_pressed_during_left_ctrl:
+                            write_event('PTT_STOP')
+                            print(f"[{timestamp}] >>> LEFT CTRL released - Typing transcription <<<", flush=True)
+                        else:
+                            write_event('PTT_CANCEL')
+                            print(f"[{timestamp}] >>> LEFT CTRL released with combo - Type Mode CANCELLED <<<", flush=True)
+                        other_key_pressed_during_left_ctrl = False
+
+                else:
+                    # Track if any other key was pressed while Left Ctrl is held
+                    if left_ctrl_pressed and key_event.keystate == 1:
+                        other_key_pressed_during_left_ctrl = True
+                        print(f"[{timestamp}] >>> Other key pressed during Ctrl hold - will cancel PTT <<<", flush=True)
 
     except KeyboardInterrupt:
         print("\n[INFO] Keyboard listener stopped", file=sys.stderr)
