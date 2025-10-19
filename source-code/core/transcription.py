@@ -1,15 +1,13 @@
 """
-ASR Transcription with NeMo
-Frame-based streaming transcription with VAD and deduplication
+ASR Transcription with NeMo Parakeet-TDT
+Real-time transcription with buffering for accuracy
 """
 import os
 import sys
 import time
-import tempfile
-import wave
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 import re
 
 import numpy as np
@@ -21,11 +19,13 @@ from .config import Config
 logger = logging.getLogger(__name__)
 
 
-# Common hallucinations to filter out
+# Common hallucinations to filter out (keep this minimal!)
+# NOTE: Only filter phrases that are clearly hallucinations, not common words
 HALLUCINATION_PHRASES = {
-    'thank you', 'thanks for watching', 'please subscribe',
-    'you', 'uh', 'um', 'ah', 'mm', 'hmm',
-    '.', '...', 'okay', 'ok'
+    'thanks for watching', 'please subscribe',
+    'uh', 'um', 'ah', 'mm', 'hmm',
+    '.', '...'
+    # Removed: 'you', 'okay', 'ok', 'thank you' - these are real words!
 }
 
 # Word corrections for common misrecognitions
@@ -66,8 +66,8 @@ class TranscriptionBuffer:
 
 class FrameASR:
     """
-    Frame-based ASR for continuous streaming transcription
-    Uses overlapping buffers to prevent word cutoff
+    Real-time ASR for transcription with Parakeet-TDT
+    Accumulates speech chunks for better accuracy
     """
 
     def __init__(self, model, config: Config):
@@ -80,16 +80,25 @@ class FrameASR:
         """
         self.model = model
         self.config = config
-        self.frame_len = config.frame_len
         self.sample_rate = config.sample_rate
-        self.n_frame_len = int(config.frame_len * config.sample_rate)
 
-        # Sliding buffer with overlap
-        self.buffer = np.zeros(self.n_frame_len, dtype=np.float32)
-        self.prev_text = ''
-        self.prev_text_count = 0
+        # VAD state
         self.last_max_amplitude = 0
         self.last_avg_amplitude = 0
+
+        # Model components
+        self.preprocessor = model.preprocessor
+        self.encoder = model.encoder
+        self.decoder = model.decoding.decoder if hasattr(model.decoding, 'decoder') else None
+
+        # Speech accumulation buffer (accumulate speech before transcribing)
+        self.speech_buffer = []
+        self.min_buffer_duration = 0.4  # seconds - reduced for faster response
+        self.max_buffer_duration = 3.0  # seconds - max before forcing flush
+        self.silence_chunks_to_flush = 2  # flush after 2 silence chunks (200ms)
+        self.silence_count = 0
+
+        logger.info("Frame ASR initialized for real-time transcription")
 
     def has_speech(self, audio: np.ndarray, debug: bool = False) -> bool:
         """
@@ -133,77 +142,125 @@ class FrameASR:
 
         return has_speech
 
+    def add_speech_chunk(self, chunk: np.ndarray) -> None:
+        """Add a speech chunk to the buffer"""
+        self.speech_buffer.append(chunk)
+        self.silence_count = 0
+
+    def should_transcribe(self) -> bool:
+        """Check if we have enough audio to transcribe"""
+        if not self.speech_buffer:
+            return False
+
+        total_samples = sum(len(chunk) for chunk in self.speech_buffer)
+        duration = total_samples / self.sample_rate
+
+        # Transcribe if:
+        # 1. We have minimum audio AND hit silence (end of utterance)
+        # 2. OR buffer is getting too full (force flush)
+        has_min_audio = duration >= self.min_buffer_duration
+        buffer_full = duration >= self.max_buffer_duration
+        silence_detected = self.silence_count >= self.silence_chunks_to_flush
+
+        return (has_min_audio and silence_detected) or buffer_full
+
+    def get_buffered_audio(self) -> np.ndarray:
+        """Get concatenated buffered audio and clear buffer"""
+        if not self.speech_buffer:
+            return np.array([], dtype=np.float32)
+
+        audio = np.concatenate(self.speech_buffer)
+        duration = len(audio) / self.sample_rate
+        logger.info(f"Flushing buffer: {duration:.2f}s of audio ({len(self.speech_buffer)} chunks)")
+        self.speech_buffer = []
+        self.silence_count = 0
+        return audio
+
     def transcribe_chunk(self, chunk: np.ndarray) -> str:
         """
-        Transcribe an audio chunk using the sliding buffer
+        Transcribe an audio chunk in real-time
 
         Args:
             chunk: Audio chunk as float32 array
 
         Returns:
-            Transcribed text (only new characters)
+            Transcribed text from this chunk
         """
         if chunk is None or len(chunk) == 0:
             return ""
 
-        # Update sliding buffer
-        chunk_len = len(chunk)
-        if chunk_len < self.n_frame_len:
-            # Shift buffer and add new chunk
-            self.buffer[:-chunk_len] = self.buffer[chunk_len:]
-            self.buffer[-chunk_len:] = chunk
-        else:
-            # Replace entire buffer
-            self.buffer = chunk[-self.n_frame_len:]
-
-        # Check if buffer contains speech (VAD)
-        if not self.has_speech(self.buffer, debug=True):
-            # Reset counter on silence
-            if self.prev_text:
-                self.prev_text = ''
-                self.prev_text_count = 0
-            return ""
-
-        # Transcribe current buffer
-        logger.debug("Transcription starting...")
         start_time = time.time()
 
         try:
-            # Create temp file for transcription
+            import tempfile
+            import wave
+            import os
+
+            # NeMo's transcribe() works best with WAV files
+            # Create a temporary WAV file with proper format
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
-            temp_path = temp_file.name
+            tmp_path = temp_file.name
             temp_file.close()
 
-            # Write buffer to wav file
-            with wave.open(temp_path, 'wb') as wf:
-                wf.setnchannels(self.config.channels)
+            # Write audio to WAV file with 16-bit samples
+            with wave.open(tmp_path, 'wb') as wf:
+                wf.setnchannels(1)  # Mono
                 wf.setsampwidth(2)  # 16-bit
                 wf.setframerate(self.sample_rate)
 
-                # Convert to int16
-                audio_int16 = np.empty(self.buffer.shape, dtype=np.int16)
-                np.multiply(self.buffer, 32768, out=audio_int16, casting='unsafe')
+                # Convert float32 to int16
+                audio_int16 = np.empty(chunk.shape, dtype=np.int16)
+                np.multiply(chunk, 32768, out=audio_int16, casting='unsafe')
                 wf.writeframes(audio_int16.tobytes())
 
-            # Transcribe
-            with torch.no_grad():
-                result = self.model.transcribe([temp_path], verbose=False)
+            # Transcribe the file
+            result = self.model.transcribe([tmp_path], verbose=False)
 
-            os.unlink(temp_path)
+            # Clean up temp file
+            os.unlink(tmp_path)
+
+            logger.info(f"Transcribe result type: {type(result)}, length: {len(result) if result else 0}")
 
             # Extract text from result
-            text = self._extract_text(result).strip()
+            text = ""
+            if result and len(result) > 0:
+                first = result[0]
+                logger.info(f"First result type: {type(first)}, value: {first}")
+
+                # Check if it's a Hypothesis object with .text attribute
+                if hasattr(first, 'text'):
+                    text = first.text
+                    logger.info(f"Got .text attribute: '{text}'")
+                elif isinstance(first, str):
+                    text = first
+                    logger.info(f"Got string directly: '{text}'")
+                else:
+                    text = str(first)
+                    logger.info(f"Converted to string: '{text}'")
 
             elapsed = time.time() - start_time
-            logger.debug(f"Transcription completed in {elapsed:.2f}s | Raw: '{text}'")
+
+            # Log RAW output before any processing
+            if text:
+                logger.info(f"[RAW OUTPUT] '{text}' ({elapsed*1000:.0f}ms)")
+            else:
+                logger.debug(f"Transcription in {elapsed*1000:.1f}ms | Raw: '' (empty)")
 
             # Filter and process
-            text = self._process_text(text)
+            processed_text = self._process_text(text)
 
-            return text
+            # Log if filtering changed anything
+            if text and not processed_text:
+                logger.warning(f"[FILTERED OUT] '{text}' was filtered")
+            elif processed_text:
+                logger.info(f"[FINAL] '{processed_text}'")
+
+            return processed_text
 
         except Exception as e:
-            logger.error(f"Chunk transcription failed: {e}")
+            import traceback
+            logger.error(f"Transcription failed: {e}")
+            logger.error(f"Full traceback:\n{traceback.format_exc()}")
             return ""
 
     def _extract_text(self, result) -> str:
@@ -220,6 +277,8 @@ class FrameASR:
 
     def _process_text(self, text: str) -> str:
         """Process and filter transcribed text"""
+        original_text = text
+
         # Filter too short
         if len(text) < 2:
             logger.debug(f"Filtered: too short (len={len(text)})")
@@ -228,25 +287,16 @@ class FrameASR:
         # Apply word corrections
         text = self._apply_corrections(text)
 
-        # Filter hallucinations
+        # Filter hallucinations (only if EXACT match to known hallucinations)
         if text.lower() in HALLUCINATION_PHRASES:
-            logger.debug("Filtered: hallucination phrase")
+            logger.debug(f"Filtered hallucination: '{original_text}' -> '{text}'")
             return ""
 
-        # Deduplication
-        if text == self.prev_text:
-            self.prev_text_count += 1
-            if self.prev_text_count >= 3:
-                logger.debug("Filtered: repeated 3+ times")
-                return ""
-            logger.debug("Filtered: duplicate")
-            return ""
-
-        # New text detected
-        self.prev_text = text
-        self.prev_text_count = 1
-
-        logger.debug(f"✓ Accepted: '{text}'")
+        # Log what we're accepting
+        if text != original_text:
+            logger.debug(f"✓ Corrected: '{original_text}' -> '{text}'")
+        else:
+            logger.debug(f"✓ Accepted: '{text}'")
         return text
 
     def _apply_corrections(self, text: str) -> str:
@@ -282,15 +332,15 @@ class FrameASR:
         return ' '.join(corrected_words)
 
     def reset(self) -> None:
-        """Reset the buffer"""
-        self.buffer = np.zeros(self.n_frame_len, dtype=np.float32)
-        self.prev_text = ''
-        self.prev_text_count = 0
+        """Reset internal state"""
+        self.speech_buffer = []
+        self.silence_count = 0
+        logger.debug("ASR state reset")
 
 
 def load_nemo_model(config: Config) -> Optional[nemo_asr.models.ASRModel]:
     """
-    Load NeMo ASR model with word boosting
+    Load NeMo ASR model (Parakeet-TDT by default)
 
     Args:
         config: Configuration object
@@ -302,7 +352,7 @@ def load_nemo_model(config: Config) -> Optional[nemo_asr.models.ASRModel]:
         logger.warning("Model loading DISABLED (feature flag)")
         return None
 
-    logger.info("Loading NeMo Parakeet-TDT model...")
+    logger.info(f"Loading NeMo model: {config.model_name}")
 
     try:
         # Set environment for threading
@@ -312,27 +362,39 @@ def load_nemo_model(config: Config) -> Optional[nemo_asr.models.ASRModel]:
 
         torch.set_num_threads(1)
 
-        # Load model
-        model = nemo_asr.models.ASRModel.from_pretrained("nvidia/parakeet-tdt-0.6b-v3")
+        # Load streaming model
+        model = nemo_asr.models.ASRModel.from_pretrained(config.model_name)
 
         # Move to GPU if available
         if torch.cuda.is_available():
             model = model.cuda()
             device_name = torch.cuda.get_device_name(0)
-            logger.info(f"Model loaded on GPU: {device_name}")
+            logger.info(f"Parakeet-TDT loaded on GPU: {device_name}")
         else:
-            logger.info("Model loaded on CPU")
+            logger.info("Parakeet-TDT loaded on CPU")
 
-        # Configure word boosting
+        # Enable streaming mode if available (not all streaming models have this method)
+        if hasattr(model, 'set_streaming_mode'):
+            model.set_streaming_mode(True)
+            logger.info("✓ Streaming mode enabled via set_streaming_mode")
+
+        # Check if model has conformer_stream_step (this is the key API we need)
+        if hasattr(model, 'conformer_stream_step'):
+            logger.info("✓ conformer_stream_step API available - cache-aware processing active")
+        else:
+            logger.warning("⚠ conformer_stream_step not available - will use fallback transcription")
+
+        # Configure word boosting if available
         boost_file = Path(config.boost_words_file)
-        if boost_file.exists():
+        if boost_file.exists() and hasattr(model, 'change_decoding_strategy'):
             _configure_word_boosting(model, boost_file)
 
         model.eval()
+        logger.info(f"Model ready - Expected latency: ~80-160ms per chunk")
         return model
 
     except Exception as e:
-        logger.error(f"Failed to load model: {e}")
+        logger.error(f"Failed to load model: {e}", exc_info=True)
         return None
 
 

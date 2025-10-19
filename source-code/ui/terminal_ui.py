@@ -22,9 +22,11 @@ class ToggleButton(Button):
     """Button widget that can be toggled on/off with different colors"""
 
     is_active = reactive(False)
+    can_focus = True  # Allow button to receive focus
 
     def __init__(self, label: str, *args, **kwargs):
         super().__init__(label, *args, **kwargs)
+        self.update_classes()  # Initialize classes on creation
 
     def toggle(self) -> None:
         """Toggle the button state"""
@@ -105,8 +107,11 @@ class MicMonitor(Static):
 class JarvisApp(App):
     """Textual App for JARVIS Dashboard"""
 
-    # Enable Ctrl+C to quit
-    BINDINGS = [("ctrl+c", "quit", "Quit")]
+    # Keyboard shortcuts
+    # Note: Ctrl key alone is handled by keyboard_listener.py
+    BINDINGS = [
+        ("ctrl+c", "quit", "Quit"),
+    ]
 
     CSS = """
     Screen {
@@ -217,6 +222,8 @@ class JarvisApp(App):
         self.refresh_rate = refresh_rate
         self.transcription_count = 0
         self.log_count = 0
+        self.keyboard_event_file = "/tmp/jarvis-keyboard-events"
+        self.last_keyboard_check_pos = 0
 
     def compose(self) -> ComposeResult:
         """Create child widgets"""
@@ -269,6 +276,58 @@ class JarvisApp(App):
         sys_log = self.query_one("#logs", RichLog)
         sys_log.write("[#99ccff]⚡ System initialized[/#99ccff]")
 
+    def check_keyboard_events(self) -> None:
+        """Check for keyboard events and handle Control key press"""
+        try:
+            import os
+            if not os.path.exists(self.keyboard_event_file):
+                return
+
+            # Read new events from file
+            with open(self.keyboard_event_file, 'r') as f:
+                # On first run, skip to end of file to ignore old events
+                if self.last_keyboard_check_pos == 0:
+                    f.seek(0, 2)  # Seek to end
+                    self.last_keyboard_check_pos = f.tell()
+                    return  # Don't process old events
+
+                f.seek(self.last_keyboard_check_pos)
+                new_events = f.read()
+                self.last_keyboard_check_pos = f.tell()
+
+            # Process events
+            for line in new_events.strip().split('\n'):
+                if not line:
+                    continue
+
+                # Parse event: "key_name:timestamp"
+                parts = line.split(':')
+                if len(parts) >= 1:
+                    key_name = parts[0]
+
+                    # Check for Control key press (various formats from different keyboard libraries)
+                    if key_name in ['ctrl_l', 'ctrl_r', 'ctrl', 'leftctrl', 'rightctrl', 'ENABLE_TYPE_MODE']:
+                        # Get the Type Mode button
+                        type_btn = self.query_one("#type-mode-btn", ToggleButton)
+
+                        # Toggle Type Mode (enable if off, disable if on)
+                        type_btn.is_active = not type_btn.is_active
+                        type_btn.update_classes()
+
+                        # Update state in data bridge
+                        self.data_bridge.update_state(type_mode=type_btn.is_active)
+
+                        say_script = "/home/paul/Work/jarvis/source-code/services/say.sh"
+                        if type_btn.is_active:
+                            subprocess.Popen([say_script, "type mode enabled"])
+                            self.data_bridge.send_log("INFO", "Type Mode: ON - Enabled by Control key press")
+                        else:
+                            subprocess.Popen([say_script, "type mode disabled"])
+                            self.data_bridge.send_log("INFO", "Type Mode: OFF - Disabled by Control key press")
+        except Exception as e:
+            # Silently ignore errors to not disrupt UI
+            pass
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Handle button presses"""
         button = event.button
@@ -294,6 +353,39 @@ class JarvisApp(App):
                     subprocess.Popen([say_script, "chat mode enabled"])
                 else:
                     subprocess.Popen([say_script, "chat mode disabled"])
+
+    def action_toggle_type_mode(self) -> None:
+        """Action to toggle Type Mode via keyboard"""
+        try:
+            type_btn = self.query_one("#type-mode-btn", ToggleButton)
+            type_btn.toggle()
+
+            # Update state in data bridge
+            self.data_bridge.update_state(type_mode=type_btn.is_active)
+
+            say_script = "/home/paul/Work/jarvis/source-code/services/say.sh"
+            if type_btn.is_active:
+                subprocess.Popen([say_script, "type mode enabled"])
+                self.data_bridge.send_log("INFO", "Type Mode: ON - Transcriptions will be typed automatically")
+            else:
+                subprocess.Popen([say_script, "type mode disabled"])
+                self.data_bridge.send_log("INFO", "Type Mode: OFF")
+        except Exception as e:
+            self.data_bridge.send_log("ERROR", f"Failed to toggle Type Mode: {e}")
+
+    def action_toggle_chat_mode(self) -> None:
+        """Action to toggle Chat Mode via keyboard"""
+        try:
+            chat_btn = self.query_one("#chat-mode-btn", ToggleButton)
+            chat_btn.toggle()
+
+            say_script = "/home/paul/Work/jarvis/source-code/services/say.sh"
+            if chat_btn.is_active:
+                subprocess.Popen([say_script, "chat mode enabled"])
+            else:
+                subprocess.Popen([say_script, "chat mode disabled"])
+        except Exception as e:
+            self.data_bridge.send_log("ERROR", f"Failed to toggle Chat Mode: {e}")
 
     def update_data(self) -> None:
         """Update UI from data bridge (called periodically)"""
@@ -364,6 +456,9 @@ class JarvisApp(App):
             # Update border title with count
             sys_log.border_title = f"📋 System Logs ({self.log_count})"
 
+        # Check for keyboard events (Control key to enable Type Mode)
+        self.check_keyboard_events()
+
 
 class JarvisUI:
     """
@@ -388,12 +483,64 @@ class JarvisUI:
         """Set callback to call when UI quits"""
         self._shutdown_callback = callback
 
+    def show_splash_screen(self) -> None:
+        """Show Iron Man ASCII art splash screen for 1 second"""
+        import sys
+        import time
+
+        splash = """⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⢀⢄⢄⠢⡠⡀⢀⠄⡀⡀⠄⠄⠄⠄⠐⠡⠄⠉⠻⣻⣟⣿⣿⣄⠄⠄⠄⠄⠄⠄⠄⠄
+⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⢠⢣⠣⡎⡪⢂⠊⡜⣔⠰⡐⠠⠄⡾⠄⠈⠠⡁⡂⠄⠔⠸⣻⣿⣿⣯⢂⠄⠄⠄⠄⠄⠄
+⠄⠄⠄⠄⠄⠄⠄⠄⡀⠄⠄⠄⠄⠄⠄⠄⠐⢰⡱⣝⢕⡇⡪⢂⢊⢪⢎⢗⠕⢕⢠⣻⠄⠄⠄⠂⠢⠌⡀⠄⠨⢚⢿⣿⣧⢄⠄⠄⠄⠄⠄
+⠄⠄⠄⠄⠄⠄⠄⡐⡈⠌⠄⠄⠄⠄⠄⠄⠄⡧⣟⢼⣕⢝⢬⠨⡪⡚⡺⡸⡌⡆⠜⣾⠄⠄⠄⠁⡐⠠⣐⠨⠄⠁⠹⡹⡻⣷⡕⢄⠄⠄⠄
+⠄⠄⠄⠄⠄⠄⢄⠇⠂⠄⠄⠄⠄⠄⠄⠄⢸⣻⣕⢗⠵⣍⣖⣕⡼⡼⣕⢭⢮⡆⠱⣽⡇⠄⠄⠂⠁⠄⢁⠢⡁⠄⠄⠐⠈⠺⢽⣳⣄⠄⠄
+⠄⠄⠄⠄⠄⢔⢕⢌⠄⠄⠄⠄⠄⢀⠄⠄⣾⢯⢳⠹⠪⡺⡺⣚⢜⣽⣮⣳⡻⡇⡙⣜⡇⠄⠄⢸⠄⠄⠂⡀⢠⠂⠄⢶⠊⢉⡁⠨⡒⠄⠄
+⠄⠄⠄⠄⡨⣪⣿⢰⠈⠄⠄⠄⡀⠄⠄⠄⣽⣵⢿⣸⢵⣫⣳⢅⠕⡗⣝⣼⣺⠇⡘⡲⠇⠄⠄⠨⠄⠐⢀⠐⠐⠡⢰⠁⠄⣴⣾⣷⣮⣇⠄
+⠄⠄⠄⠄⡮⣷⣿⠪⠄⠄⠄⠠⠄⠂⠠⠄⡿⡞⡇⡟⣺⣺⢷⣿⣱⢕⢵⢺⢼⡁⠪⣘⡇⠄⠄⢨⠄⠐⠄⠄⢀⠄⢸⠄⠄⣿⣿⣿⣿⣿⡆
+⠄⠄⠄⢸⣺⣿⣿⣇⠄⠄⠄⠄⢀⣤⣖⢯⣻⡑⢕⢭⢷⣻⣽⡾⣮⡳⡵⣕⣗⡇⠡⡣⣃⠄⠄⠸⠄⠄⠄⠄⠄⠄⠈⠄⠄⢻⣿⣿⣵⡿⣹
+⠄⠄⠄⢸⣿⣿⣟⣯⢄⢤⢲⣺⣻⣻⡺⡕⡔⡊⡎⡮⣿⣿⣽⡿⣿⣻⣼⣼⣺⡇⡀⢎⢨⢐⢄⡀⠄⢁⠠⠄⠄⠐⠄⠣⠄⠸⣿⣿⣯⣷⣿
+⠄⠄⠄⢸⣿⣿⣿⢽⠲⡑⢕⢵⢱⢪⡳⣕⢇⢕⡕⣟⣽⣽⣿⣿⣿⣿⣿⣿⣿⢗⢜⢜⢬⡳⣝⢸⣢⢀⠄⠄⠐⢀⠄⡀⠆⠄⠸⣿⣿⣿⣿
+⠄⠄⠄⢸⣿⣿⣿⢽⣝⢎⡪⡰⡢⡱⡝⡮⡪⡣⣫⢎⣿⣿⣿⣿⣿⣿⠟⠋⠄⢄⠄⠈⠑⠑⠭⡪⡪⢏⠗⡦⡀⠐⠄⠄⠈⠄⠄⠙⣿⣿⣿
+⠄⠄⠄⠘⣿⣿⣿⣿⡲⣝⢮⢪⢊⢎⢪⢺⠪⣝⢮⣯⢯⣟⡯⠷⠋⢀⣠⣶⣾⡿⠿⢀⣴⣖⢅⠪⠘⡌⡎⢍⣻⠠⠅⠄⠄⠈⠢⠄⠄⠙⠿
+⠄⠄⠄⠄⣿⣿⣿⣿⣽⢺⢍⢎⢎⢪⡪⡮⣪⣿⣞⡟⠛⠋⢁⣠⣶⣿⡿⠛⠋⢀⣤⢾⢿⣕⢇⠡⢁⢑⠪⡳⡏⠄⠄⠄⠄⠄⠄⢑⠤⢀⢠
+⠄⠄⠄⠄⢸⣿⣿⣿⣟⣮⡳⣭⢪⡣⡯⡮⠗⠋⠁⠄⠄⠈⠿⠟⠋⣁⣀⣴⣾⣿⣗⡯⡳⡕⡕⡕⡡⢂⠊⢮⠃⠄⠄⠄⠄⠄⢀⠐⠨⢁⠨
+⠄⠄⠄⠄⠈⢿⣿⣿⣿⠷⠯⠽⠐⠁⠁⢀⡀⣤⢖⣽⢿⣦⣶⣾⣿⣿⣿⣿⣿⣿⢎⠇⡪⣸⡪⡮⠊⠄⠌⠎⡄⠄⠄⠄⠄⠄⠄⡂⢁⠉⡀
+⠄⠄⠄⠄⠄⠈⠛⠚⠒⠵⣶⣶⣶⣶⢪⢃⢇⠏⡳⡕⣝⢽⡽⣻⣿⣿⣿⣿⡿⣺⠰⡱⢜⢮⡟⠁⠄⠄⠅⠅⢂⠐⠄⠐⢀⠄⠄⠄⠂⡁⠂
+⠄⠄⠄⠄⠄⠄⠄⠰⠄⠐⢒⣠⣿⣟⢖⠅⠆⢝⢸⡪⡗⡅⡯⣻⣺⢯⡷⡯⡏⡇⡅⡏⣯⡟⠄⠄⠄⠨⡊⢔⢁⠠⠄⠄⠄⠄⠄⢀⠄⠄⠄
+⠄⠄⠄⠄⠄⠄⠄⠄⠹⣿⣿⣿⣿⢿⢕⢇⢣⢸⢐⢇⢯⢪⢪⠢⡣⠣⢱⢑⢑⠰⡸⡸⡇⠁⠄⠄⠠⡱⠨⢘⠄⠂⡀⠂⠄⠄⠄⠄⠈⠂⠄
+⠄⠄⠄⠄⠄⠄⠄⠄⠄⢻⣿⣿⣿⣟⣝⢔⢅⠸⡘⢌⠮⡨⡪⠨⡂⠅⡑⡠⢂⢇⢇⢿⠁⠄⢀⠠⠨⡘⢌⡐⡈⠄⠄⠠⠄⠄⠄⠄⠄⠄⠁
+⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠹⣿⣿⣿⣯⢢⢊⢌⢂⠢⠑⠔⢌⡂⢎⠔⢔⢌⠎⡎⡮⡃⢀⠐⡐⠨⡐⠌⠄⡑⠄⢂⠐⢀⠄⠄⠈⠄⠄⠄⠄
+⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠙⣿⣿⣿⣯⠂⡀⠔⢔⠡⡹⠰⡑⡅⡕⡱⠰⡑⡜⣜⡅⡢⡈⡢⡑⡢⠁⠰⠄⠨⢀⠐⠄⠄⠄⠄⠄⠄⠄⠄
+⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠈⠻⢿⣿⣷⣢⢱⠡⡊⢌⠌⡪⢨⢘⠜⡌⢆⢕⢢⢇⢆⢪⢢⡑⡅⢁⡖⡄⠄⠄⠄⢀⠄⠄⠄⠄⠄⠄⠄
+⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠛⢿⣿⣵⡝⣜⢐⠕⢌⠢⡑⢌⠌⠆⠅⠑⠑⠑⠝⢜⠌⠠⢯⡚⡜⢕⢄⠄⠁⠄⠄⠄⠄⠄⠄⠄
+⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠙⢿⣷⡣⣇⠃⠅⠁⠈⡠⡠⡔⠜⠜⣿⣗⡖⡦⣰⢹⢸⢸⢸⡘⠌⠄⠄⠄⠄⠄⠄⠄⠄⠄
+⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠈⠋⢍⣠⡤⡆⣎⢇⣇⢧⡳⡍⡆⢿⣯⢯⣞⡮⣗⣝⢎⠇⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄
+⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠁⣿⣿⣎⢦⠣⠳⠑⠓⠑⠃⠩⠉⠈⠈⠉⠄⠁⠉⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄
+⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠈⡿⡞⠁⠄⠄⢀⠐⢐⠠⠈⡌⠌⠂⡁⠌⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄
+⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠈⢂⢂⢀⠡⠄⣈⠠⢄⠡⠒⠈⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄
+⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠢⠠⠊⠨⠐⠈⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄⠄"""
+
+        # Clear screen and display splash
+        print("\033[2J\033[H", end='')
+        print(splash)
+        sys.stdout.flush()
+
+        # Wait for 1 second
+        time.sleep(1)
+
+        # Clear screen for the terminal UI
+        print("\033[2J\033[H", end='')
+        sys.stdout.flush()
+
     def start(self) -> None:
         """Start UI (blocking call - runs in main thread)"""
         if self.running:
             return
 
         self.running = True
+
+        # Splash screen disabled - it interferes with Textual UI
+        # self.show_splash_screen()
+
         # Textual app.run() is blocking and handles its own event loop
         try:
             self.app.run()

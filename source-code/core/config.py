@@ -42,9 +42,17 @@ class Config:
         self.device_sample_rate = self._get_int('DEVICE_SAMPLE_RATE', 48000)
 
         # VAD Configuration
-        self.silence_threshold = self._get_int('SILENCE_THRESHOLD', 10)
-        self.min_speech_ratio = self._get_float('MIN_SPEECH_RATIO', 0.0001)
+        self.silence_threshold = self._get_int('SILENCE_THRESHOLD', 100)  # Increased from 10 to 100
+        self.min_speech_ratio = self._get_float('MIN_SPEECH_RATIO', 0.01)  # Increased from 0.0001 to 0.01 (1%)
         self.frame_len = self._get_float('FRAME_LEN', 1.6)
+
+        # Model Configuration
+        self.model_name = self._get_str('MODEL_NAME', 'nvidia/parakeet-tdt-0.6b-v3')
+
+        # Streaming Configuration
+        self.streaming_chunk_size = self._get_int('STREAMING_CHUNK_SIZE', 8)  # Number of frames per chunk
+        self.streaming_left_context = self._get_int('STREAMING_LEFT_CONTEXT', 32)  # Left context frames
+        self.decoder_type = self._get_str('DECODER_TYPE', 'rnnt')  # 'rnnt' or 'ctc'
 
         # Paths
         self.log_file = self._get_str('LOG_FILE', 'data/chat.txt')

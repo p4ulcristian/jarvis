@@ -132,7 +132,14 @@ class Jarvis:
     def continuous_logging(self) -> None:
         """Main loop: continuous speech capture and transcription"""
         # Import only when needed
-        import numpy as np
+        try:
+            import numpy as np
+        except ImportError as e:
+            self.logger.error(f"Failed to import numpy: {e}")
+            if self.data_bridge:
+                self.data_bridge.send_log("ERROR", f"Failed to import numpy: {e}")
+            return
+
         from datetime import datetime
         from core import AudioCapture
 
@@ -143,10 +150,8 @@ class Jarvis:
         if not self.config.enable_model:
             self.logger.info("Microphone test mode (model disabled)")
         else:
-            self.logger.info("Starting continuous speech capture...")
+            self.logger.info("Starting real-time continuous transcription...")
 
-        # Accumulator for audio chunks
-        audio_accumulator = []
         chunks_captured = 0
 
         try:
@@ -162,71 +167,81 @@ class Jarvis:
 
                     chunks_captured += 1
 
-                    # Accumulate chunks
-                    audio_accumulator.append(audio_chunk)
-
                     # Calculate and send audio level for UI (every chunk)
                     if self.data_bridge:
                         max_amp, avg_amp = AudioCapture.calculate_energy(audio_chunk)
                         self.data_bridge.send_audio_level(max_amp, avg_amp)
 
-                    # Process when we have enough audio (frame length)
-                    total_samples = sum(len(chunk) for chunk in audio_accumulator)
-                    frame_samples = int(self.config.frame_len * self.config.sample_rate)
-
-                    if total_samples >= frame_samples:
-                        # Combine accumulated audio
-                        combined_audio = np.concatenate(audio_accumulator)
-
-                        # Test mode: just show stats
-                        if not self.config.enable_model or not self.config.enable_transcription:
+                    # Test mode: just show stats
+                    if not self.config.enable_model or not self.config.enable_transcription:
+                        # Check if this chunk contains speech (for display only)
+                        has_speech = self.frame_asr.has_speech(audio_chunk, debug=False)
+                        if has_speech:
+                            chunk_duration = len(audio_chunk) / self.config.sample_rate
                             self.logger.info(
-                                f"MIC TEST: {total_samples} samples "
-                                f"({total_samples/self.config.sample_rate:.2f}s) "
+                                f"MIC TEST: {len(audio_chunk)} samples "
+                                f"({chunk_duration:.2f}s) "
                                 f"- max: {max_amp:.0f}"
                             )
+                    else:
+                        # Check if chunk has speech
+                        has_speech = self.frame_asr.has_speech(audio_chunk, debug=False)
+
+                        if has_speech:
+                            # Add speech to buffer
+                            self.frame_asr.add_speech_chunk(audio_chunk)
                         else:
-                            # Transcribe
-                            if self.data_bridge:
-                                self.data_bridge.update_state(processing=True)
+                            # Increment silence counter
+                            self.frame_asr.silence_count += 1
 
-                            text = self.frame_asr.transcribe_chunk(combined_audio)
+                        # Check if we should transcribe accumulated audio
+                        if self.frame_asr.should_transcribe():
+                            # Get buffered audio
+                            buffered_audio = self.frame_asr.get_buffered_audio()
 
-                            if self.data_bridge:
-                                self.data_bridge.update_state(processing=False)
-
-                            if text:
-                                # Log to file
-                                self.log_conversation(text)
-
-                                # Add to buffer
-                                self.transcription_buffer.add(text)
-
-                                # Send to UI
+                            if len(buffered_audio) > 0:
                                 if self.data_bridge:
-                                    self.data_bridge.send_transcription(text)
+                                    self.data_bridge.update_state(processing=True)
 
-                                # Check if Type Mode is active and type the text
-                                if self.data_bridge and self.keyboard_typer:
-                                    state = self.data_bridge.get_state()
-                                    if state.type_mode:
-                                        try:
-                                            self.keyboard_typer.type_text(text)
-                                            self.logger.debug(f"Typed: {text}")
-                                        except Exception as e:
-                                            self.logger.error(f"Failed to type text: {e}")
+                                text = self.frame_asr.transcribe_chunk(buffered_audio)
 
-                                # Display (only if no UI)
-                                if not self.config.enable_ui:
-                                    timestamp = datetime.now().strftime('%H:%M:%S')
-                                    self.logger.info(f"[{timestamp}] {text}")
+                                if self.data_bridge:
+                                    self.data_bridge.update_state(processing=False)
 
-                        # Reset accumulator with overlap
-                        overlap_samples = int(0.4 * self.config.sample_rate)
-                        if len(combined_audio) > overlap_samples:
-                            audio_accumulator = [combined_audio[-overlap_samples:]]
+                                self.logger.debug(f"Transcription result: '{text}' (empty={not text})")
+                            else:
+                                text = ""
+
                         else:
-                            audio_accumulator = []
+                            # Not ready to transcribe yet
+                            continue
+
+                        # Only log/display non-empty transcriptions
+                        if text:
+                            # Log to file
+                            self.log_conversation(text)
+
+                            # Add to buffer
+                            self.transcription_buffer.add(text)
+
+                            # Send to UI
+                            if self.data_bridge:
+                                self.data_bridge.send_transcription(text)
+
+                            # Check if Type Mode is active and type the text
+                            if self.data_bridge and self.keyboard_typer:
+                                state = self.data_bridge.get_state()
+                                if state.type_mode:
+                                    try:
+                                        self.keyboard_typer.type_text(text)
+                                        self.logger.debug(f"Typed: {text}")
+                                    except Exception as e:
+                                        self.logger.error(f"Failed to type text: {e}")
+
+                            # Display (only if no UI)
+                            if not self.config.enable_ui:
+                                timestamp = datetime.now().strftime('%H:%M:%S')
+                                self.logger.info(f"[{timestamp}] {text}")
 
                 except KeyboardInterrupt:
                     raise
@@ -253,6 +268,12 @@ class Jarvis:
             Path(self.config.improved_log_file).write_text('')
         except Exception as e:
             self.logger.warning(f"Could not clear log files: {e}")
+
+        # Clear keyboard events file to start fresh (may fail if owned by root)
+        try:
+            Path('/tmp/jarvis-keyboard-events').write_text('')
+        except (PermissionError, Exception) as e:
+            self.logger.debug(f"Could not clear keyboard events file (may need sudo): {e}")
 
         # Initialize keyboard typer
         try:

@@ -3,14 +3,33 @@
 Keyboard listener for Jarvis - logs all key presses
 Writes events to a file for consumption by the main process
 Displays keypresses in real-time
+Uses evdev for Wayland compatibility
 """
 import time
 import sys
 from datetime import datetime
-from pynput import keyboard
+from evdev import InputDevice, categorize, ecodes, list_devices
 
 # File to write keyboard events
 EVENT_FILE = "/tmp/jarvis-keyboard-events"
+
+def find_keyboard_device():
+    """Find the keyboard input device"""
+    devices = [InputDevice(path) for path in list_devices()]
+
+    # Look for keyboard device
+    for device in devices:
+        # Check if device has keyboard capabilities
+        caps = device.capabilities()
+        if ecodes.EV_KEY in caps:
+            # Check if it has letter keys (indicates keyboard not just power button)
+            keys = caps[ecodes.EV_KEY]
+            if ecodes.KEY_A in keys or ecodes.KEY_LEFTCTRL in keys:
+                print(f"[INFO] Using keyboard device: {device.name} ({device.path})", file=sys.stderr)
+                return device
+
+    print("[ERROR] No keyboard device found", file=sys.stderr)
+    return None
 
 def write_event(key_name):
     """Write a keyboard event to the event file"""
@@ -22,71 +41,57 @@ def write_event(key_name):
     except Exception as e:
         print(f"[ERROR] Failed to write event: {e}", file=sys.stderr)
 
-def get_key_name(key):
-    """Get a readable name for the key"""
+def get_key_name(keycode):
+    """Get a readable name for the key code"""
     try:
-        # Try to get character for regular keys
-        if hasattr(key, 'char') and key.char is not None:
-            return key.char
-        # For special keys, get the name
-        elif hasattr(key, 'name'):
-            return key.name
-        else:
-            return str(key).replace('Key.', '')
-    except:
-        return str(key)
-
-def format_key_display(key):
-    """Format key for display (make special keys readable)"""
-    try:
-        # Regular character keys
-        if hasattr(key, 'char') and key.char is not None:
-            # Show space visibly
-            if key.char == ' ':
-                return '[SPACE]'
-            # Show newlines
-            elif key.char == '\n':
-                return '[ENTER]'
-            elif key.char == '\t':
-                return '[TAB]'
-            else:
-                return key.char
-        # Special keys - show in brackets
-        elif hasattr(key, 'name'):
-            return f'[{key.name.upper()}]'
-        else:
-            key_str = str(key).replace('Key.', '')
-            return f'[{key_str.upper()}]'
-    except:
-        return '[UNKNOWN]'
-
-def on_press(key):
-    """Called when a key is pressed"""
-    key_name = get_key_name(key)
-    write_event(key_name)
-
-    # Display in real-time with timestamp
-    timestamp = datetime.now().strftime('%H:%M:%S')
-    display = format_key_display(key)
-    print(f"[{timestamp}] {display}", flush=True)
-
-def on_release(key):
-    """Called when a key is released"""
-    pass  # Don't log release events
+        return ecodes.KEY[keycode]
+    except KeyError:
+        return f"KEY_{keycode}"
 
 def main():
     """Main entry point"""
     # Clear event file
     try:
         open(EVENT_FILE, 'w').close()
+        print(f"[INFO] Event file initialized: {EVENT_FILE}", file=sys.stderr)
     except Exception as e:
         print(f"[ERROR] Failed to initialize file: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Start listening
+    # Find keyboard device
+    device = find_keyboard_device()
+    if not device:
+        print("[ERROR] Cannot proceed without keyboard device", file=sys.stderr)
+        print("[HINT] You may need to run this script with sudo or add your user to the 'input' group:", file=sys.stderr)
+        print("       sudo usermod -a -G input $USER", file=sys.stderr)
+        print("       Then log out and log back in.", file=sys.stderr)
+        sys.exit(1)
+
+    print("[INFO] Listening for keyboard events... Press Ctrl+C to exit", file=sys.stderr)
+
+    # Listen for events
     try:
-        with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-            listener.join()
+        for event in device.read_loop():
+            if event.type == ecodes.EV_KEY:
+                key_event = categorize(event)
+
+                # Only process key down events (not key up)
+                if key_event.keystate == 1:  # 1 = key down, 0 = key up, 2 = key hold
+                    key_name = get_key_name(event.code)
+
+                    # Remove KEY_ prefix if present
+                    if key_name.startswith('KEY_'):
+                        key_name = key_name[4:].lower()
+
+                    # Write event
+                    write_event(key_name)
+
+                    # Display in real-time with timestamp
+                    timestamp = datetime.now().strftime('%H:%M:%S')
+                    print(f"[{timestamp}] {key_name}", flush=True)
+
+    except KeyboardInterrupt:
+        print("\n[INFO] Keyboard listener stopped", file=sys.stderr)
     except Exception as e:
         print(f"[ERROR] Keyboard listener failed: {e}", file=sys.stderr)
         sys.exit(1)
