@@ -4,10 +4,15 @@ JARVIS - Voice-to-Text System with Streaming NeMo ASR
 Production-ready refactored version with modular architecture
 """
 import sys
+import os
 import signal
 import threading
 import logging
 from typing import Optional
+
+# Suppress noisy library logging BEFORE any imports (prevents TUI interference)
+os.environ['HYDRA_FULL_ERROR'] = '0'
+os.environ['NEMO_LOG_LEVEL'] = 'ERROR'
 
 # Import ONLY UI modules at startup for fast loading
 from ui import DataBridge, JarvisUI
@@ -288,10 +293,17 @@ def main():
 
 
 if __name__ == "__main__":
-    # Set up basic logging for main module
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
+    # Set up file-only logging for main module (no stdout - TUI handles display)
+    from core import setup_logging
+
+    # Configure root logger to prevent any StreamHandlers from being added
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.WARNING)
+    # Remove any existing handlers on root logger (prevents stdout output)
+    for handler in root_logger.handlers[:]:
+        if isinstance(handler, logging.StreamHandler):
+            root_logger.removeHandler(handler)
+
+    setup_logging(debug=False, name='__main__', data_bridge=None)
 
     sys.exit(main())

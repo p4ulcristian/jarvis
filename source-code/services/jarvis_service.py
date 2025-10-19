@@ -36,16 +36,14 @@ class JarvisService:
         """
         # Defer heavy imports
         from core import setup_logging, RollingBuffer
-        from ui.data_bridge import UILogHandler
 
         self.config = config
         self.data_bridge = data_bridge
-        self.logger = setup_logging(debug=config.debug_mode, name='jarvis')
-
-        # Add UI log handler if data bridge provided
-        if self.data_bridge:
-            ui_handler = UILogHandler(self.data_bridge)
-            self.logger.addHandler(ui_handler)
+        self.logger = setup_logging(
+            debug=config.debug_mode,
+            name='jarvis',
+            data_bridge=self.data_bridge
+        )
 
         # Core components (lazy initialized)
         self.model = None
@@ -53,12 +51,17 @@ class JarvisService:
         self.audio_capture = None
         self.transcription_buffer = RollingBuffer(max_duration=config.buffer_duration)
         self.keyboard_typer = None
+        self.transcription_worker = None
 
         # State management
         self.shutdown = False
         self.last_trigger_time = 0
         self.last_detection_time = 0
         self.is_running = False
+
+        # Performance monitoring
+        self.last_metrics_log = 0
+        self.metrics_log_interval = 60.0  # Log metrics every 60 seconds
 
         self.logger.info("JarvisService initialized")
 
@@ -91,6 +94,17 @@ class JarvisService:
         if self.config.enable_transcription:
             self.frame_asr = FrameASR(self.model, self.config)
             self.logger.info("Frame ASR initialized")
+
+            # Initialize transcription worker for async processing
+            from core.transcription_worker import TranscriptionWorker
+            self.transcription_worker = TranscriptionWorker(
+                frame_asr=self.frame_asr,
+                timeout=10.0,  # 10 second timeout for transcription
+                max_queue_size=50,
+                callback=None  # We'll poll for results
+            )
+            self.transcription_worker.start()
+            self.logger.info("Transcription worker started with 10s timeout protection")
 
         if self.data_bridge:
             self.data_bridge.update_state(model_loaded=True)
@@ -195,6 +209,7 @@ class JarvisService:
         iteration = 0
         last_ptt_state = False
         ptt_transcriptions = []
+        chunks_skipped = 0  # Track skipped chunks for graceful degradation
 
         try:
             while not self.shutdown:
@@ -254,7 +269,7 @@ class JarvisService:
                                 f"({chunk_duration:.2f}s) - max: {max_amp:.0f}"
                             )
                     else:
-                        # Continuous transcription mode
+                        # Continuous transcription mode with async worker
                         has_speech = self.frame_asr.has_speech(audio_chunk, debug=False)
 
                         if has_speech:
@@ -269,31 +284,75 @@ class JarvisService:
                             buffered_audio = self.frame_asr.get_buffered_audio()
 
                             if len(buffered_audio) > 0:
-                                if self.data_bridge:
-                                    self.data_bridge.update_state(processing=True)
+                                # Submit to async worker (non-blocking)
+                                if self.transcription_worker:
+                                    submitted = self.transcription_worker.submit(buffered_audio)
 
-                                # Transcribe (with retry logic built-in)
-                                text = self.frame_asr.transcribe_chunk(buffered_audio)
+                                    if submitted:
+                                        if self.data_bridge:
+                                            self.data_bridge.update_state(processing=True)
+                                        chunks_skipped = 0  # Reset skip counter
+                                    else:
+                                        # Worker queue is full - graceful degradation
+                                        chunks_skipped += 1
+                                        self.logger.warning(
+                                            f"Transcription queue full - skipping chunk "
+                                            f"({chunks_skipped} chunks skipped so far)"
+                                        )
+                                        if self.data_bridge and chunks_skipped == 1:
+                                            self.data_bridge.send_log(
+                                                "WARNING",
+                                                "System degraded - transcription falling behind"
+                                            )
 
+                                        # Check worker health after multiple failures
+                                        if chunks_skipped > 10:
+                                            if not self.transcription_worker.is_healthy():
+                                                self.logger.critical(
+                                                    "Transcription worker unhealthy - may need restart"
+                                                )
+                                                if self.data_bridge:
+                                                    self.data_bridge.update_state(
+                                                        error="Transcription system degraded"
+                                                    )
+
+                        # Poll for transcription results (non-blocking)
+                        if self.transcription_worker:
+                            result = self.transcription_worker.get_result(timeout=0.001)
+                            if result:
                                 if self.data_bridge:
                                     self.data_bridge.update_state(processing=False)
 
-                                # Process transcription
-                                if text:
-                                    self.log_conversation(text)
-                                    self.transcription_buffer.add(text)
+                                if result.success and result.text:
+                                    # Process successful transcription
+                                    self.log_conversation(result.text)
+                                    self.transcription_buffer.add(result.text)
 
                                     # Always send to UI
                                     if self.data_bridge:
-                                        self.data_bridge.send_transcription(text)
+                                        self.data_bridge.send_transcription(result.text)
 
                                     # If PTT is active, buffer for typing when released
                                     if ptt_active:
-                                        ptt_transcriptions.append(text)
+                                        ptt_transcriptions.append(result.text)
 
                                     if not self.config.enable_ui:
                                         timestamp = datetime.now().strftime('%H:%M:%S')
-                                        self.logger.info(f"[{timestamp}] {text}")
+                                        self.logger.info(f"[{timestamp}] {result.text}")
+
+                                elif not result.success:
+                                    # Log transcription errors
+                                    if result.error:
+                                        self.logger.error(
+                                            f"Transcription failed: {result.error} "
+                                            f"(latency: {result.latency:.1f}s)"
+                                        )
+
+                        # Periodic metrics logging
+                        current_time = time.time()
+                        if current_time - self.last_metrics_log > self.metrics_log_interval:
+                            self._log_performance_metrics()
+                            self.last_metrics_log = current_time
 
                 except KeyboardInterrupt:
                     raise
@@ -354,11 +413,51 @@ class JarvisService:
         self.shutdown = True
         self.logger.info("Stopping JARVIS service...")
 
+    def _log_performance_metrics(self) -> None:
+        """Log performance metrics for monitoring"""
+        try:
+            # Audio queue stats
+            if self.audio_capture:
+                audio_stats = self.audio_capture.get_queue_stats()
+                self.logger.info(
+                    f"[METRICS] Audio queue: {audio_stats['size']}/{audio_stats['capacity']} "
+                    f"({audio_stats['utilization_pct']:.0f}%)"
+                )
+
+            # Transcription worker stats
+            if self.transcription_worker:
+                metrics = self.transcription_worker.get_metrics()
+                success_rate = (metrics.successful / metrics.total_requests * 100) if metrics.total_requests > 0 else 0
+                self.logger.info(
+                    f"[METRICS] Transcription: {metrics.successful}/{metrics.total_requests} success "
+                    f"({success_rate:.1f}%), avg latency: {metrics.avg_latency:.2f}s, "
+                    f"max: {metrics.max_latency:.2f}s, timeouts: {metrics.timeouts}, "
+                    f"queue: {metrics.queue_depth}/{metrics.queue_capacity}"
+                )
+
+                # Send to UI if available
+                if self.data_bridge and metrics.total_requests > 0:
+                    self.data_bridge.send_log(
+                        "INFO",
+                        f"Performance: {success_rate:.0f}% success, "
+                        f"{metrics.avg_latency:.1f}s avg latency"
+                    )
+
+        except Exception as e:
+            self.logger.error(f"Error logging metrics: {e}")
+
     def cleanup(self) -> None:
         """Cleanup resources"""
         self.shutdown = True
         self.is_running = False
         self.logger.info("Cleaning up JARVIS resources...")
+
+        # Stop transcription worker
+        if self.transcription_worker:
+            try:
+                self.transcription_worker.stop()
+            except Exception as e:
+                self.logger.error(f"Error stopping transcription worker: {e}")
 
         # Stop audio stream
         if self.audio_capture:

@@ -42,9 +42,12 @@ class AudioCapture:
 
         # Streaming mode components
         self.stream = None
-        self.audio_queue = queue.Queue(maxsize=100)  # Buffer up to 100 chunks (~10 seconds)
+        self.audio_queue = queue.Queue(maxsize=200)  # Buffer up to 200 chunks (~20 seconds)
         self.is_streaming = False
         self.stream_lock = threading.Lock()
+
+        # Queue monitoring
+        self.queue_warnings_logged = False  # Prevent log spam
 
         logger.info(f"Audio initialized: {self.device_sample_rate}Hz -> {self.target_sample_rate}Hz")
         if config.enable_error_recovery:
@@ -188,7 +191,11 @@ class AudioCapture:
                 # Start the stream
                 self.stream.start()
                 self.is_streaming = True
-                logger.info(f"Continuous audio stream started (chunk={self.chunk_size} samples, {self.chunk_size/self.target_sample_rate*1000:.1f}ms)")
+                logger.info(
+                    f"Continuous audio stream started "
+                    f"(chunk={self.chunk_size} samples, {self.chunk_size/self.target_sample_rate*1000:.1f}ms, "
+                    f"queue_capacity={self.audio_queue.maxsize})"
+                )
                 return True
 
             except Exception as e:
@@ -221,6 +228,25 @@ class AudioCapture:
         except Exception as e:
             logger.error(f"Error getting audio chunk: {e}")
             return None
+
+    def get_queue_stats(self) -> dict:
+        """
+        Get current queue statistics
+
+        Returns:
+            Dictionary with queue stats
+        """
+        queue_size = self.audio_queue.qsize()
+        queue_capacity = self.audio_queue.maxsize
+        utilization = queue_size / queue_capacity if queue_capacity > 0 else 0
+
+        return {
+            'size': queue_size,
+            'capacity': queue_capacity,
+            'utilization': utilization,
+            'utilization_pct': utilization * 100,
+            'is_healthy': utilization < 0.75
+        }
 
     def stop_stream(self) -> None:
         """Stop continuous audio streaming"""
@@ -279,8 +305,36 @@ class AudioCapture:
             # Put in queue (non-blocking - drop if full)
             try:
                 self.audio_queue.put_nowait(audio_float)
+
+                # Queue monitoring - log utilization at thresholds
+                queue_size = self.audio_queue.qsize()
+                queue_capacity = self.audio_queue.maxsize
+                utilization = queue_size / queue_capacity
+
+                if utilization > 0.75:
+                    logger.critical(
+                        f"Audio queue critical: {queue_size}/{queue_capacity} "
+                        f"({utilization*100:.0f}% full) - Transcription falling behind"
+                    )
+                    self.queue_warnings_logged = True
+                elif utilization > 0.50:
+                    if not self.queue_warnings_logged:
+                        logger.warning(
+                            f"Audio queue high: {queue_size}/{queue_capacity} "
+                            f"({utilization*100:.0f}% full)"
+                        )
+                        self.queue_warnings_logged = True
+                elif self.queue_warnings_logged:
+                    # Queue recovered
+                    logger.info(f"Audio queue recovered: {queue_size}/{queue_capacity} ({utilization*100:.0f}% full)")
+                    self.queue_warnings_logged = False
+
             except queue.Full:
-                logger.warning("Audio queue full - dropping chunk (processing too slow)")
+                logger.error(
+                    f"Audio queue FULL - dropping chunk! "
+                    f"({self.audio_queue.maxsize}/{self.audio_queue.maxsize}) "
+                    f"Transcription is severely lagging"
+                )
 
         except Exception as e:
             # Never let exceptions crash the audio thread

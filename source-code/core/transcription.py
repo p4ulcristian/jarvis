@@ -6,9 +6,47 @@ import os
 import sys
 import time
 import logging
+import warnings
 from pathlib import Path
 from typing import Optional, Tuple
 import re
+
+# Suppress NeMo/PyTorch logging BEFORE importing (prevents stdout interference with TUI)
+os.environ['HYDRA_FULL_ERROR'] = '0'  # Suppress Hydra verbose errors
+os.environ['NEMO_LOG_LEVEL'] = 'ERROR'  # Set NeMo log level
+
+# Comprehensive NeMo logger suppression (catches runtime loggers too)
+_nemo_loggers = [
+    'nemo_logger',
+    'nemo',
+    'nemo.collections',
+    'nemo.core',
+    'nemo.utils',
+    'nemo.collections.asr',
+    'nemo.collections.common',
+    'lhotse',  # NeMo's data loading library
+    'pytorch_lightning',
+    'torch',
+    'lightning',
+    'lightning_fabric',
+    'hydra',
+    'omegaconf',
+]
+for logger_name in _nemo_loggers:
+    logging.getLogger(logger_name).setLevel(logging.CRITICAL)
+    logging.getLogger(logger_name).propagate = False
+
+# Also suppress the root logger's StreamHandlers to catch any stragglers
+_root_logger = logging.getLogger()
+for handler in _root_logger.handlers[:]:
+    if isinstance(handler, logging.StreamHandler) and handler.stream in (sys.stdout, sys.stderr):
+        _root_logger.removeHandler(handler)
+
+# Suppress Python warnings from NeMo/Lhotse
+warnings.filterwarnings('ignore', category=UserWarning, module='nemo')
+warnings.filterwarnings('ignore', category=UserWarning, module='lhotse')
+warnings.filterwarnings('ignore', category=FutureWarning, module='nemo')
+warnings.filterwarnings('ignore', category=FutureWarning, module='lhotse')
 
 import numpy as np
 import torch
@@ -27,8 +65,41 @@ from .constants import (
     SILENCE_CHUNKS_TO_FLUSH
 )
 from .retry import exponential_backoff, RetryExhausted
+from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def suppress_nemo_output():
+    """
+    Context manager to suppress NeMo output by temporarily disabling loggers
+    Simpler and safer than stream redirection - avoids I/O issues
+
+    Only suppresses during quick operations (not model loading)
+    """
+    # Save original warning filters
+    original_filters = warnings.filters[:]
+
+    # Save original logger levels
+    saved_levels = {}
+    for logger_name in _nemo_loggers:
+        log = logging.getLogger(logger_name)
+        saved_levels[logger_name] = log.level
+        log.setLevel(logging.CRITICAL + 1)  # Above CRITICAL = no output
+
+    try:
+        # Suppress all warnings during NeMo operations
+        warnings.simplefilter('ignore')
+
+        yield
+    finally:
+        # Restore logger levels
+        for logger_name, level in saved_levels.items():
+            logging.getLogger(logger_name).setLevel(level)
+
+        # Restore warning filters
+        warnings.filters[:] = original_filters
 
 
 class TranscriptionBuffer:
@@ -205,30 +276,39 @@ class FrameASR:
             import tempfile
             import wave
             import os
+            import io
 
             start_time = time.time()
 
-            # NeMo's transcribe() works best with WAV files
-            # Create a temporary WAV file with proper format
+            # Use in-memory buffer for WAV generation (faster than disk I/O)
+            wav_buffer = io.BytesIO()
+
+            # Write audio to WAV buffer with 16-bit samples
+            with wave.open(wav_buffer, 'wb') as wf:
+                wf.setnchannels(1)  # Mono
+                wf.setsampwidth(2)  # 16-bit
+                wf.setframerate(self.sample_rate)
+
+                # Convert float32 to int16
+                audio_int16 = np.empty(chunk.shape, dtype=np.int16)
+                np.multiply(chunk, 32768, out=audio_int16, casting='unsafe')
+                wf.writeframes(audio_int16.tobytes())
+
+            # Get WAV data from buffer
+            wav_data = wav_buffer.getvalue()
+            wav_buffer.close()
+
+            # NeMo requires a file path, write minimal temp file
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
             tmp_path = temp_file.name
+            temp_file.write(wav_data)
             temp_file.close()
 
             try:
-                # Write audio to WAV file with 16-bit samples
-                with wave.open(tmp_path, 'wb') as wf:
-                    wf.setnchannels(1)  # Mono
-                    wf.setsampwidth(2)  # 16-bit
-                    wf.setframerate(self.sample_rate)
-
-                    # Convert float32 to int16
-                    audio_int16 = np.empty(chunk.shape, dtype=np.int16)
-                    np.multiply(chunk, 32768, out=audio_int16, casting='unsafe')
-                    wf.writeframes(audio_int16.tobytes())
-
-                # Transcribe the file
+                # Transcribe the file with output suppression (prevents TUI interference)
                 # Canary-1B Flash returns Hypothesis objects with .text attribute
-                result = self.model.transcribe([tmp_path], verbose=False)
+                with suppress_nemo_output():
+                    result = self.model.transcribe([tmp_path], verbose=False)
 
                 logger.debug(f"Transcribe result type: {type(result)}, length: {len(result) if result else 0}")
 
@@ -410,6 +490,28 @@ class FrameASR:
         self.silence_count = 0
         logger.debug("ASR state reset")
 
+    def is_model_healthy(self) -> bool:
+        """
+        Check if model is healthy and responsive
+
+        Returns:
+            True if healthy, False if potentially stuck
+        """
+        try:
+            # Quick health check - try to access model attributes
+            if self.model is None:
+                return False
+
+            # Check if model is on expected device
+            if hasattr(self.model, 'device'):
+                _ = self.model.device
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Model health check failed: {e}")
+            return False
+
 
 def load_nemo_model(config: Config) -> Optional[EncDecMultiTaskModel]:
     """
@@ -436,25 +538,34 @@ def load_nemo_model(config: Config) -> Optional[EncDecMultiTaskModel]:
         torch.set_num_threads(1)
 
         # Load Canary multi-task model
+        # NOTE: Not suppressing output during load to capture any errors
         model = EncDecMultiTaskModel.from_pretrained(config.model_name)
 
         # Move to GPU if available
         if torch.cuda.is_available():
             model = model.cuda()
+
+        # Log after suppression context exits
+        if torch.cuda.is_available():
             device_name = torch.cuda.get_device_name(0)
             logger.info(f"Canary-1B Flash loaded on GPU: {device_name}")
         else:
             logger.info("Canary-1B Flash loaded on CPU")
 
-        # Configure greedy decoding for optimal speed/accuracy
-        decode_cfg = model.cfg.decoding
-        decode_cfg.beam.beam_size = config.canary_beam_size  # 1 for greedy (fastest)
-        model.change_decoding_strategy(decode_cfg)
+        # Configure greedy decoding for optimal speed/accuracy (suppress output)
+        with suppress_nemo_output():
+            decode_cfg = model.cfg.decoding
+            decode_cfg.beam.beam_size = config.canary_beam_size  # 1 for greedy (fastest)
+            model.change_decoding_strategy(decode_cfg)
+
         logger.info(f"✓ Greedy decoding configured (beam_size={config.canary_beam_size})")
 
-        # Enable streaming mode if available
+        # Enable streaming mode if available (suppress output)
+        with suppress_nemo_output():
+            if hasattr(model, 'set_streaming_mode'):
+                model.set_streaming_mode(True)
+
         if hasattr(model, 'set_streaming_mode'):
-            model.set_streaming_mode(True)
             logger.info("✓ Streaming mode enabled")
 
         # Configure word boosting if available
@@ -462,7 +573,10 @@ def load_nemo_model(config: Config) -> Optional[EncDecMultiTaskModel]:
         if boost_file.exists() and hasattr(model, 'change_decoding_strategy'):
             _configure_word_boosting(model, boost_file)
 
-        model.eval()
+        # Set model to eval mode (suppress any potential output)
+        with suppress_nemo_output():
+            model.eval()
+
         logger.info(f"Model ready - Expected latency: <50ms per chunk (1000+ RTFx)")
         logger.info(f"Language: {config.canary_source_lang} → {config.canary_target_lang} | Task: {config.canary_task}")
         return model
@@ -483,14 +597,17 @@ def _configure_word_boosting(model, boost_file: Path) -> None:
 
         logger.info(f"Word boost enabled: {len(key_phrases)} phrases")
 
-        from omegaconf import OmegaConf
-        decoding_cfg = OmegaConf.create({
-            'strategy': 'greedy_batch',
-            'context_score': 3.0,
-            'key_phrases_list': key_phrases
-        })
+        # Suppress NeMo output during decoding strategy change
+        with suppress_nemo_output():
+            from omegaconf import OmegaConf
+            decoding_cfg = OmegaConf.create({
+                'strategy': 'greedy_batch',
+                'context_score': 3.0,
+                'key_phrases_list': key_phrases
+            })
 
-        model.change_decoding_strategy(decoding_cfg)
+            model.change_decoding_strategy(decoding_cfg)
+
         logger.info("GPU-PB word boosting configured")
 
     except Exception as e:
