@@ -208,7 +208,7 @@ class JarvisService:
         self.is_running = True
         iteration = 0
         last_ptt_state = False
-        ptt_transcriptions = []
+        ptt_recording_mode = False  # Track if we're in isolated PTT recording
         chunks_skipped = 0  # Track skipped chunks for graceful degradation
 
         try:
@@ -227,26 +227,84 @@ class JarvisService:
                     ptt_released = last_ptt_state and not ptt_active
                     last_ptt_state = ptt_active
 
-                    # When PTT is pressed, clear the transcription buffer
+                    # When PTT is pressed, start isolated recording session
                     if ptt_pressed:
-                        ptt_transcriptions = []
+                        ptt_recording_mode = True
+                        # Clear the frame ASR buffer for isolated recording
+                        if self.frame_asr:
+                            self.frame_asr.reset()
                         if self.data_bridge:
-                            self.data_bridge.send_log("INFO", "Type Mode: Hold to record, release to type")
+                            self.data_bridge.send_log("INFO", "Recording... (release Ctrl to transcribe and type)")
 
-                    # When PTT is released, type all transcriptions from this session
-                    if ptt_released and ptt_transcriptions:
-                        combined_text = " ".join(ptt_transcriptions)
-                        if self.keyboard_typer:
-                            try:
-                                self.keyboard_typer.paste_text(combined_text)
-                                self.logger.debug(f"Auto-typed: {combined_text}")
+                    # When PTT is released, transcribe the isolated recording and paste
+                    if ptt_released and ptt_recording_mode:
+                        ptt_recording_mode = False
+
+                        # Get the buffered audio from isolated recording
+                        if self.frame_asr:
+                            buffered_audio = self.frame_asr.get_buffered_audio()
+
+                            if len(buffered_audio) > 0:
                                 if self.data_bridge:
-                                    self.data_bridge.send_log("INFO", f"Typed: {combined_text[:50]}...")
-                            except Exception as e:
-                                self.logger.error(f"Failed to auto-type text: {e}", exc_info=True)
-                        ptt_transcriptions = []
+                                    self.data_bridge.send_log("INFO", "Processing recording...")
+                                    self.data_bridge.update_state(processing=True)
 
-                    # ALWAYS capture and process audio (continuous transcription)
+                                # Submit to async worker (non-blocking)
+                                if self.transcription_worker:
+                                    submitted = self.transcription_worker.submit(buffered_audio)
+
+                                    if submitted:
+                                        # Wait for transcription result with polling (up to 15 seconds)
+                                        # Poll multiple times to handle longer transcriptions
+                                        result = None
+                                        max_wait_time = 15.0
+                                        poll_interval = 0.5
+                                        elapsed = 0.0
+
+                                        while elapsed < max_wait_time and not result:
+                                            result = self.transcription_worker.get_result(timeout=poll_interval)
+                                            if not result:
+                                                elapsed += poll_interval
+                                                # Continue polling
+
+                                        if result and result.success and result.text:
+                                            # Paste the transcription
+                                            if self.keyboard_typer:
+                                                try:
+                                                    self.keyboard_typer.paste_text(result.text)
+                                                    self.logger.debug(f"PTT typed: {result.text} (latency: {elapsed:.1f}s)")
+                                                    if self.data_bridge:
+                                                        self.data_bridge.send_log("INFO", f"Typed: {result.text[:50]}...")
+                                                        self.data_bridge.send_transcription(result.text)
+                                                        self.data_bridge.update_state(processing=False)
+
+                                                    # Log to conversation file
+                                                    self.log_conversation(result.text)
+                                                    self.transcription_buffer.add(result.text)
+                                                except Exception as e:
+                                                    self.logger.error(f"Failed to auto-type PTT text: {e}", exc_info=True)
+                                                    if self.data_bridge:
+                                                        self.data_bridge.update_state(processing=False)
+                                        elif result and not result.success:
+                                            self.logger.warning(f"PTT transcription failed: {result.error}")
+                                            if self.data_bridge:
+                                                self.data_bridge.send_log("WARNING", f"Transcription failed: {result.error}")
+                                                self.data_bridge.update_state(processing=False)
+                                        else:
+                                            self.logger.warning(f"PTT transcription timeout after {max_wait_time}s")
+                                            if self.data_bridge:
+                                                self.data_bridge.send_log("WARNING", f"Transcription timeout (waited {elapsed:.1f}s)")
+                                                self.data_bridge.update_state(processing=False)
+                                    else:
+                                        self.logger.warning("Failed to submit PTT audio for transcription")
+                                        if self.data_bridge:
+                                            self.data_bridge.send_log("WARNING", "Transcription queue full")
+                                            self.data_bridge.update_state(processing=False)
+                            else:
+                                if self.data_bridge:
+                                    self.data_bridge.send_log("INFO", "No audio recorded")
+
+                    # ALWAYS capture and process audio
                     # get_chunk() retrieves from the continuous stream queue
                     audio_chunk = self.audio_capture.get_chunk(timeout=1.0)
                     if audio_chunk is None:
@@ -269,84 +327,88 @@ class JarvisService:
                                 f"({chunk_duration:.2f}s) - max: {max_amp:.0f}"
                             )
                     else:
-                        # Continuous transcription mode with async worker
-                        has_speech = self.frame_asr.has_speech(audio_chunk, debug=False)
+                        # Isolated PTT recording mode: buffer audio but don't transcribe
+                        if ptt_recording_mode:
+                            has_speech = self.frame_asr.has_speech(audio_chunk, debug=False)
+                            if has_speech:
+                                # Buffer speech for later transcription
+                                self.frame_asr.add_speech_chunk(audio_chunk)
 
-                        if has_speech:
-                            # Add speech to buffer
-                            self.frame_asr.add_speech_chunk(audio_chunk)
-                        else:
-                            # Silence detected - increment silence counter
-                            self.frame_asr.increment_silence()
+                        # Continuous transcription mode (when PTT not active)
+                        elif not ptt_recording_mode:
+                            has_speech = self.frame_asr.has_speech(audio_chunk, debug=False)
 
-                        # Check if we should transcribe (respects min buffer, silence counter, and max buffer)
-                        if self.frame_asr.should_transcribe():
-                            buffered_audio = self.frame_asr.get_buffered_audio()
+                            if has_speech:
+                                # Add speech to buffer
+                                self.frame_asr.add_speech_chunk(audio_chunk)
+                            else:
+                                # Silence detected - increment silence counter
+                                self.frame_asr.increment_silence()
 
-                            if len(buffered_audio) > 0:
-                                # Submit to async worker (non-blocking)
-                                if self.transcription_worker:
-                                    submitted = self.transcription_worker.submit(buffered_audio)
+                            # Check if we should transcribe (respects min buffer, silence counter, and max buffer)
+                            if self.frame_asr.should_transcribe():
+                                buffered_audio = self.frame_asr.get_buffered_audio()
 
-                                    if submitted:
-                                        if self.data_bridge:
-                                            self.data_bridge.update_state(processing=True)
-                                        chunks_skipped = 0  # Reset skip counter
-                                    else:
-                                        # Worker queue is full - graceful degradation
-                                        chunks_skipped += 1
-                                        self.logger.warning(
-                                            f"Transcription queue full - skipping chunk "
-                                            f"({chunks_skipped} chunks skipped so far)"
-                                        )
-                                        if self.data_bridge and chunks_skipped == 1:
-                                            self.data_bridge.send_log(
-                                                "WARNING",
-                                                "System degraded - transcription falling behind"
+                                if len(buffered_audio) > 0:
+                                    # Submit to async worker (non-blocking)
+                                    if self.transcription_worker:
+                                        submitted = self.transcription_worker.submit(buffered_audio)
+
+                                        if submitted:
+                                            if self.data_bridge:
+                                                self.data_bridge.update_state(processing=True)
+                                            chunks_skipped = 0  # Reset skip counter
+                                        else:
+                                            # Worker queue is full - graceful degradation
+                                            chunks_skipped += 1
+                                            self.logger.warning(
+                                                f"Transcription queue full - skipping chunk "
+                                                f"({chunks_skipped} chunks skipped so far)"
                                             )
-
-                                        # Check worker health after multiple failures
-                                        if chunks_skipped > 10:
-                                            if not self.transcription_worker.is_healthy():
-                                                self.logger.critical(
-                                                    "Transcription worker unhealthy - may need restart"
+                                            if self.data_bridge and chunks_skipped == 1:
+                                                self.data_bridge.send_log(
+                                                    "WARNING",
+                                                    "System degraded - transcription falling behind"
                                                 )
-                                                if self.data_bridge:
-                                                    self.data_bridge.update_state(
-                                                        error="Transcription system degraded"
+
+                                            # Check worker health after multiple failures
+                                            if chunks_skipped > 10:
+                                                if not self.transcription_worker.is_healthy():
+                                                    self.logger.critical(
+                                                        "Transcription worker unhealthy - may need restart"
                                                     )
+                                                    if self.data_bridge:
+                                                        self.data_bridge.update_state(
+                                                            error="Transcription system degraded"
+                                                        )
 
-                        # Poll for transcription results (non-blocking)
-                        if self.transcription_worker:
-                            result = self.transcription_worker.get_result(timeout=0.001)
-                            if result:
-                                if self.data_bridge:
-                                    self.data_bridge.update_state(processing=False)
-
-                                if result.success and result.text:
-                                    # Process successful transcription
-                                    self.log_conversation(result.text)
-                                    self.transcription_buffer.add(result.text)
-
-                                    # Always send to UI
+                            # Poll for transcription results (non-blocking)
+                            if self.transcription_worker:
+                                result = self.transcription_worker.get_result(timeout=0.001)
+                                if result:
                                     if self.data_bridge:
-                                        self.data_bridge.send_transcription(result.text)
+                                        self.data_bridge.update_state(processing=False)
 
-                                    # If PTT is active, buffer for typing when released
-                                    if ptt_active:
-                                        ptt_transcriptions.append(result.text)
+                                    if result.success and result.text:
+                                        # Process successful transcription
+                                        self.log_conversation(result.text)
+                                        self.transcription_buffer.add(result.text)
 
-                                    if not self.config.enable_ui:
-                                        timestamp = datetime.now().strftime('%H:%M:%S')
-                                        self.logger.info(f"[{timestamp}] {result.text}")
+                                        # Always send to UI
+                                        if self.data_bridge:
+                                            self.data_bridge.send_transcription(result.text)
 
-                                elif not result.success:
-                                    # Log transcription errors
-                                    if result.error:
-                                        self.logger.error(
-                                            f"Transcription failed: {result.error} "
-                                            f"(latency: {result.latency:.1f}s)"
-                                        )
+                                        if not self.config.enable_ui:
+                                            timestamp = datetime.now().strftime('%H:%M:%S')
+                                            self.logger.info(f"[{timestamp}] {result.text}")
+
+                                    elif not result.success:
+                                        # Log transcription errors
+                                        if result.error:
+                                            self.logger.error(
+                                                f"Transcription failed: {result.error} "
+                                                f"(latency: {result.latency:.1f}s)"
+                                            )
 
                         # Periodic metrics logging
                         current_time = time.time()
