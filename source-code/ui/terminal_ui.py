@@ -57,7 +57,7 @@ class MicMonitor(Static):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.border_title = "[MIC] Audio + Status"
+        # No border title - parent container has the border
 
     def render(self) -> Text:
         """Render the mic level display and PTT status"""
@@ -126,9 +126,17 @@ class ChatWindow(Static):
         super().__init__(*args, **kwargs)
         self.border_title = "[</>] Chat"
         self.chat_log = None
+        # Track streaming messages
+        self.streaming_messages = {}  # message_id -> accumulated text
+        self.streaming_line_count = {}  # message_id -> number of lines written
 
     def compose(self) -> ComposeResult:
-        """Create chat log widget"""
+        """Create chat window with send button and log"""
+        # Send button at top
+        send_button = Button("📤 SEND", id="send-button", variant="primary")
+        yield send_button
+
+        # Chat log below
         self.chat_log = RichLog(
             highlight=True,
             markup=True,
@@ -136,25 +144,67 @@ class ChatWindow(Static):
         )
         yield self.chat_log
 
-    def add_message(self, role: str, text: str, timestamp: datetime, backend: Optional[str] = None):
+    def add_message(
+        self,
+        role: str,
+        text: str,
+        timestamp: datetime,
+        backend: Optional[str] = None,
+        is_streaming: bool = False,
+        message_id: Optional[str] = None
+    ):
         """Add a message to the chat window"""
         if not self.chat_log:
             return
 
         time_str = timestamp.strftime("%H:%M:%S")
 
-        if role == "user":
-            # User messages in bright green
-            self.chat_log.write(f"[#00ff00][{time_str}] YOU:[/#00ff00] [#33ff33]{text}[/#33ff33]")
-        elif role == "jarvis":
-            # Jarvis messages with backend indicator
-            backend_indicator = ""
-            if backend == "claude_code":
-                backend_indicator = " [#ffaa00]<CODE>[/#ffaa00]"
-            elif backend == "ollama":
-                backend_indicator = " [#33ff33]<AI>[/#33ff33]"
+        # Handle streaming messages
+        if is_streaming and message_id:
+            if message_id not in self.streaming_messages:
+                # First chunk - write the header and initial text on same line
+                if role == "user":
+                    prefix = f"[#00ff00][{time_str}] YOU:[/#00ff00] "
+                elif role == "jarvis":
+                    backend_indicator = ""
+                    if backend == "claude_code":
+                        backend_indicator = " [#ffaa00]<CODE>[/#ffaa00]"
+                    elif backend == "ollama":
+                        backend_indicator = " [#33ff33]<AI>[/#33ff33]"
+                    prefix = f"[#00ff00][{time_str}] JARVIS{backend_indicator}:[/#00ff00] "
 
-            self.chat_log.write(f"[#00ff00][{time_str}] JARVIS{backend_indicator}:[/#00ff00] [#33ff33]{text}[/#33ff33]")
+                # Write first chunk with prefix
+                self.chat_log.write(prefix + f"[#33ff33]{text}[/#33ff33]")
+                self.streaming_messages[message_id] = prefix + f"[#33ff33]{text}[/#33ff33]"
+                self.streaming_line_count[message_id] = 1
+            else:
+                # Subsequent chunks - append to same visual line by clearing and rewriting
+                self.streaming_messages[message_id] += f"[#33ff33]{text}[/#33ff33]"
+
+                # Clear the last line by writing over it
+                # Note: RichLog doesn't support in-place updates, so chunks will appear as new lines
+                # This creates a streaming "typewriter" effect where each chunk appears below
+                self.chat_log.write(f"[#33ff33]{text}[/#33ff33]")
+        else:
+            # Non-streaming or final message
+            if message_id and message_id in self.streaming_messages:
+                # Finalize streaming message - just clean up tracking
+                del self.streaming_messages[message_id]
+                del self.streaming_line_count[message_id]
+            else:
+                # Regular non-streaming message
+                if role == "user":
+                    # User messages in bright green
+                    self.chat_log.write(f"[#00ff00][{time_str}] YOU:[/#00ff00] [#33ff33]{text}[/#33ff33]")
+                elif role == "jarvis":
+                    # Jarvis messages with backend indicator
+                    backend_indicator = ""
+                    if backend == "claude_code":
+                        backend_indicator = " [#ffaa00]<CODE>[/#ffaa00]"
+                    elif backend == "ollama":
+                        backend_indicator = " [#33ff33]<AI>[/#33ff33]"
+
+                    self.chat_log.write(f"[#00ff00][{time_str}] JARVIS{backend_indicator}:[/#00ff00] [#33ff33]{text}[/#33ff33]")
 
 
 class JarvisApp(App):
@@ -212,11 +262,37 @@ class JarvisApp(App):
         border-title-color: #33ff33;
         background: #0d1409;
         height: 100%;
+        layout: vertical;
+    }
+
+    #send-button {
+        height: 3;
+        width: 100%;
+        background: #0d1409;
+        color: #00ff00;
+        border: solid #00ff00;
+        text-style: bold;
+    }
+
+    #send-button:hover {
+        background: #00ff00;
+        color: #0d1409;
+    }
+
+    #send-button:focus {
+        background: #00ff00;
+        color: #0d1409;
+    }
+
+    #send-button.disabled {
+        color: #226622;
+        border: solid #226622;
     }
 
     ChatWindow RichLog {
         border: none;
         background: #0d1409;
+        height: 1fr;
     }
 
     /* Bottom Left: System Logs */
@@ -229,14 +305,40 @@ class JarvisApp(App):
         height: 100%;
     }
 
-    /* Bottom Right: Audio Levels + Status */
-    #audio-status {
+    /* Bottom Right: Audio + Status Container */
+    #audio-status-container {
         column-span: 1;
         row-span: 1;
         border: heavy #00ff00;
         border-title-color: #33ff33;
         background: #0d1409;
         height: 100%;
+        layout: vertical;
+    }
+
+    #chat-button {
+        height: 3;
+        width: 100%;
+        background: #0d1409;
+        color: #00ff00;
+        border: solid #00ff00;
+        text-style: bold;
+    }
+
+    #chat-button:hover {
+        background: #00ff00;
+        color: #0d1409;
+    }
+
+    #chat-button:focus {
+        background: #00ff00;
+        color: #0d1409;
+    }
+
+    /* Audio Levels + Status */
+    #audio-status {
+        height: 1fr;
+        background: #0d1409;
         padding: 1;
     }
 
@@ -298,8 +400,12 @@ class JarvisApp(App):
         system_log.border_subtitle = "export: e"
         yield system_log
 
-        # Bottom Right: Audio levels + compact status
-        yield MicMonitor(id="audio-status")
+        # Bottom Right: Audio + Status Container with Chat Button
+        with Container(id="audio-status-container"):
+            chat_button = Button("💬 CHAT", id="chat-button", variant="success")
+            chat_button.border_title = "Press to Chat"
+            yield chat_button
+            yield MicMonitor(id="audio-status")
 
         # Footer
         yield Footer()
@@ -319,7 +425,16 @@ class JarvisApp(App):
         # Initialize chat window
         chat_widget = self.query_one("#chat", ChatWindow)
         if chat_widget.chat_log:
-            chat_widget.chat_log.write("[#33ff33][</>] Chat mode ready - say 'Jarvis' to start...[/#33ff33]")
+            chat_widget.chat_log.write("[#33ff33][</>] Press CHAT to start, speak, then press SEND[/#33ff33]")
+
+        # Disable send button initially
+        send_button = self.query_one("#send-button", Button)
+        send_button.disabled = True
+        send_button.add_class("disabled")
+
+        # Set border title for audio-status container
+        audio_status_container = self.query_one("#audio-status-container", Container)
+        audio_status_container.border_title = "[MIC] Audio + Status"
 
     def check_keyboard_events(self) -> None:
         """Check for keyboard events and handle < key press/release"""
@@ -374,8 +489,38 @@ class JarvisApp(App):
             pass
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        """Handle button presses (currently no buttons in UI)"""
-        pass
+        """Handle button presses"""
+        if event.button.id == "chat-button":
+            # Start accumulating mode via data bridge
+            if self.data_bridge:
+                self.data_bridge.trigger_chat()
+                self.data_bridge.update_state(chat_accumulating=True)
+                self.data_bridge.send_log("INFO", "Chat accumulating - speak your question then press SEND")
+
+                # Visual feedback
+                chat_widget = self.query_one("#chat", ChatWindow)
+                if chat_widget.chat_log:
+                    chat_widget.chat_log.write("[#ffaa00][</>] Accumulating... speak then press SEND[/#ffaa00]")
+
+                # Enable send button
+                send_button = self.query_one("#send-button", Button)
+                send_button.disabled = False
+                send_button.remove_class("disabled")
+
+        elif event.button.id == "send-button":
+            # Trigger send via data bridge
+            if self.data_bridge:
+                state = self.data_bridge.get_state()
+                if state.chat_accumulating:
+                    self.data_bridge.trigger_send()
+                    self.data_bridge.send_log("INFO", "Sending query to agent...")
+
+                    # Visual feedback - keep button enabled for next question
+                    chat_widget = self.query_one("#chat", ChatWindow)
+                    if chat_widget.chat_log:
+                        chat_widget.chat_log.write("[#226622]--- Waiting for response ---[/#226622]")
+
+                    # NOTE: Don't disable chat_accumulating - keep it active for next question
 
     def action_toggle_type_mode(self) -> None:
         """Action to toggle Type Mode via keyboard (deprecated - PTT is always auto-type)"""
@@ -514,12 +659,14 @@ class JarvisApp(App):
             if chat is None:
                 break
 
-            # Add message to chat window
+            # Add message to chat window (with streaming support)
             chat_widget.add_message(
                 role=chat.role,
                 text=chat.text,
                 timestamp=chat.timestamp,
-                backend=chat.backend
+                backend=chat.backend,
+                is_streaming=chat.is_streaming,
+                message_id=chat.message_id
             )
             chat_count += 1
 

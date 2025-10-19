@@ -1,0 +1,26 @@
+# Word Boosting Configuration
+# One word or phrase per line
+# Comments (lines starting with #) are ignored
+
+# Wake words
+Jarvis
+Hey Jarvis
+
+# Technical terms
+Claude Code
+Python
+NVIDIA
+NeMo
+Canary
+
+# Commands (if you use voice commands)
+# stop
+# pause
+# continue
+# cancel
+
+# Your domain-specific terms (add your own below)
+# Example: transcription
+# Example: microphone
+# Example: speech recognition
+

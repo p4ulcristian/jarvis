@@ -110,14 +110,31 @@ class QwenAgent:
 
     async def chat(self, user_message: str) -> AgentResponse:
         """
-        Process user message with Qwen3 agent
+        Process user message with Qwen3 agent (non-streaming)
 
         Args:
             user_message: User's message/question
 
         Returns:
-            Agent response
+            AgentResponse
         """
+        return await self._chat_non_streaming(user_message)
+
+    async def chat_stream(self, user_message: str):
+        """
+        Process user message with Qwen3 agent (streaming)
+
+        Args:
+            user_message: User's message/question
+
+        Yields:
+            Response chunks as they arrive
+        """
+        async for chunk in self._chat_streaming(user_message):
+            yield chunk
+
+    async def _chat_streaming(self, user_message: str):
+        """Streaming chat implementation"""
         try:
             # Add user message to history
             self.messages.append({
@@ -125,7 +142,64 @@ class QwenAgent:
                 'content': user_message
             })
 
-            logger.info(f"Processing message: '{user_message}'")
+            logger.info(f"Processing message (streaming): '{user_message}'")
+
+            # Build messages with system prompt
+            messages = [{'role': 'system', 'content': self.system_prompt}] + self.messages
+
+            accumulated_text = ""
+
+            response_stream = ollama.chat(
+                model=self.model,
+                messages=messages,
+                tools=self.tools if self.claude_handler else None,
+                stream=True
+            )
+
+            for chunk in response_stream:
+                message = chunk.get('message', {})
+                content = message.get('content', '')
+
+                if content:
+                    accumulated_text += content
+                    yield content  # Yield each chunk
+
+                # Check for tool calls in final chunk
+                if chunk.get('done', False):
+                    tool_calls = message.get('tool_calls', [])
+                    if tool_calls:
+                        # Tool call detected - handle it
+                        logger.info("Tool call detected in streaming mode")
+                        # For now, we don't support streaming with tool calls
+                        # Just execute the tool and return the result
+                        result = await self._handle_tool_call(tool_calls, messages)
+                        yield "\n" + result.text
+                        accumulated_text = result.text
+                        break
+
+            # Add assistant response to history
+            self.messages.append({
+                'role': 'assistant',
+                'content': accumulated_text
+            })
+
+            # Trim history
+            self._trim_history()
+
+        except Exception as e:
+            logger.error(f"Error in streaming chat: {e}", exc_info=True)
+            yield "Sorry, I encountered an error."
+
+    async def _chat_non_streaming(self, user_message: str) -> AgentResponse:
+        """Non-streaming chat implementation"""
+        try:
+            # Add user message to history
+            self.messages.append({
+                'role': 'user',
+                'content': user_message
+            })
+
+            logger.info(f"Processing message (non-streaming): '{user_message}'")
 
             # Build messages with system prompt
             messages = [{'role': 'system', 'content': self.system_prompt}] + self.messages
@@ -135,7 +209,7 @@ class QwenAgent:
                 model=self.model,
                 messages=messages,
                 tools=self.tools if self.claude_handler else None,
-                stream=False  # For now, non-streaming for simplicity
+                stream=False
             )
 
             # Check if tool was called
@@ -172,7 +246,7 @@ class QwenAgent:
             )
 
         except Exception as e:
-            logger.error(f"Error in chat: {e}", exc_info=True)
+            logger.error(f"Error in non-streaming chat: {e}", exc_info=True)
             return AgentResponse(
                 text="Sorry, I encountered an error processing your request.",
                 short_text="Sorry, I had an error.",

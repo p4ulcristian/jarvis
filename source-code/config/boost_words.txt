@@ -1,1 +1,46 @@
+# Wake Word Boosting - Optimized for "Jarvis" Recognition
+# High priority words are listed first
+
+# Primary wake word
 Jarvis
+
+# Common variations with "Hey"
+Hey Jarvis
+hey jarvis
+
+# Common mispronunciations (boost these too, corrections will fix them)
+jarvis
+jarve
+Jarve
+jarvy
+Jarvy
+jarry
+Jarry
+jervis
+Jervis
+jarvie
+Jarvie
+jarvey
+Jarvey
+jadrice
+Jadrice
+jobies
+Jobies
+jarbies
+Jarbies
+jeremies
+Jeremies
+
+# Multi-word variations
+Hey Jarvis
+hey Jarvis
+Jarvis code
+jarvis code
+
+# Additional technical terms (lower priority)
+Claude
+Claude Code
+Python
+NVIDIA
+NeMo
+Canary

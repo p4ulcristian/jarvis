@@ -52,23 +52,38 @@ class SimpleConversationManager:
             Command after wake word, or None if not detected
 
         Example:
+            "Jarvis" → "Hello" (greeting)
             "Jarvis, what's the weather?" → "what's the weather?"
             "Hey Jarvis refactor this" → "refactor this"
+            "what's the weather jarvis" → "what's the weather"
         """
         if not text:
             return None
 
         text_lower = text.lower().strip()
 
-        # Check if starts with wake word
-        if text_lower.startswith(self.wake_word):
-            # Extract command after wake word
-            command = text[len(self.wake_word):].strip()
+        # Check if wake word appears anywhere in the text
+        if self.wake_word in text_lower:
+            # Remove the wake word from the text
+            command = re.sub(
+                rf'\b{re.escape(self.wake_word)}\b',
+                '',
+                text_lower,
+                flags=re.IGNORECASE
+            ).strip()
 
-            # Remove common punctuation at start
-            command = re.sub(r'^[,.:;!?]\s*', '', command)
+            # Remove common filler words at the start
+            command = re.sub(r'^(hey|ok|okay|hi|hello)[,\s]+', '', command, flags=re.IGNORECASE).strip()
 
-            if command:
+            # Remove common punctuation at start and end
+            command = re.sub(r'^[,.:;!?\s]+', '', command)
+            command = re.sub(r'[,.:;!?\s]+$', '', command)
+
+            # If nothing left after removing wake word, use a greeting
+            if not command:
+                logger.info(f"Wake word detected: '{self.wake_word}' (greeting)")
+                return "Hello"
+            else:
                 logger.info(f"Wake word detected: '{self.wake_word}' | Command: '{command}'")
                 return command
 
@@ -76,7 +91,7 @@ class SimpleConversationManager:
 
     async def process_command(self, command: str) -> AgentResponse:
         """
-        Process a command via Qwen Agent
+        Process a command via Qwen Agent (non-streaming)
 
         Args:
             command: User command (without wake word)
@@ -86,6 +101,20 @@ class SimpleConversationManager:
         """
         logger.info(f"Processing command: '{command}'")
         return await self.agent.chat(command)
+
+    async def process_command_stream(self, command: str):
+        """
+        Process a command via Qwen Agent (streaming)
+
+        Args:
+            command: User command (without wake word)
+
+        Yields:
+            Response chunks as they arrive
+        """
+        logger.info(f"Processing command (streaming): '{command}'")
+        async for chunk in self.agent.chat_stream(command):
+            yield chunk
 
     def process_transcription(self, text: str) -> Optional[str]:
         """

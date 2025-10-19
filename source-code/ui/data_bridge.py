@@ -40,6 +40,20 @@ class ChatMessage:
     text: str
     timestamp: datetime
     backend: Optional[str] = None  # "ollama", "claude_code", or None
+    is_streaming: bool = False  # True if this is a streaming message update
+    message_id: Optional[str] = None  # Unique ID for streaming message updates
+
+
+@dataclass
+class ChatTrigger:
+    """Chat trigger event (from button press)"""
+    timestamp: datetime
+
+
+@dataclass
+class SendTrigger:
+    """Send trigger event (from send button press)"""
+    timestamp: datetime
 
 
 @dataclass
@@ -51,6 +65,7 @@ class SystemState:
     type_mode: bool
     ptt_active: bool  # Push-to-talk active state
     chat_active: bool  # Chat mode active state
+    chat_accumulating: bool  # Chat accumulating mode (between CHAT and SEND button)
     error: Optional[str]
 
 
@@ -72,6 +87,8 @@ class DataBridge:
         self.transcription_queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
         self.log_queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
         self.chat_queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
+        self.chat_trigger_queue: queue.Queue = queue.Queue(maxsize=100)  # Smaller queue for triggers
+        self.send_trigger_queue: queue.Queue = queue.Queue(maxsize=100)  # Smaller queue for send triggers
 
         # State (thread-safe with lock)
         self._state_lock = threading.Lock()
@@ -82,6 +99,7 @@ class DataBridge:
             type_mode=False,
             ptt_active=False,
             chat_active=False,
+            chat_accumulating=False,
             error=None
         )
 
@@ -186,7 +204,14 @@ class DataBridge:
             return None
 
     # Chat Message Methods
-    def send_chat_message(self, role: str, text: str, backend: Optional[str] = None) -> None:
+    def send_chat_message(
+        self,
+        role: str,
+        text: str,
+        backend: Optional[str] = None,
+        is_streaming: bool = False,
+        message_id: Optional[str] = None
+    ) -> None:
         """
         Send chat message to UI
 
@@ -194,13 +219,17 @@ class DataBridge:
             role: Message role ("user" or "jarvis")
             text: Message text
             backend: Backend used ("ollama", "claude_code", or None)
+            is_streaming: True if this is a streaming message update
+            message_id: Unique ID for streaming message (to update same message)
         """
         try:
             data = ChatMessage(
                 role=role,
                 text=text,
                 timestamp=datetime.now(),
-                backend=backend
+                backend=backend,
+                is_streaming=is_streaming,
+                message_id=message_id
             )
             self.chat_queue.put_nowait(data)
         except queue.Full:
@@ -218,6 +247,66 @@ class DataBridge:
         """
         try:
             return self.chat_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    # Chat Trigger Methods (for button presses)
+    def trigger_chat(self, transcription: str = "") -> None:
+        """
+        Trigger chat mode (from button press)
+
+        Args:
+            transcription: Optional transcription text to use as the query
+        """
+        try:
+            # Store the transcription in the trigger
+            data = ChatTrigger(
+                timestamp=datetime.now()
+            )
+            self.chat_trigger_queue.put_nowait(data)
+        except queue.Full:
+            pass  # Drop if queue is full
+
+    def get_chat_trigger(self, timeout: float = 0.01) -> Optional[ChatTrigger]:
+        """
+        Get chat trigger event (non-blocking)
+
+        Args:
+            timeout: Timeout in seconds
+
+        Returns:
+            ChatTrigger or None
+        """
+        try:
+            return self.chat_trigger_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    # Send Trigger Methods (for send button presses)
+    def trigger_send(self) -> None:
+        """
+        Trigger send (from send button press)
+        """
+        try:
+            data = SendTrigger(
+                timestamp=datetime.now()
+            )
+            self.send_trigger_queue.put_nowait(data)
+        except queue.Full:
+            pass  # Drop if queue is full
+
+    def get_send_trigger(self, timeout: float = 0.01) -> Optional[SendTrigger]:
+        """
+        Get send trigger event (non-blocking)
+
+        Args:
+            timeout: Timeout in seconds
+
+        Returns:
+            SendTrigger or None
+        """
+        try:
+            return self.send_trigger_queue.get(timeout=timeout)
         except queue.Empty:
             return None
 
@@ -249,6 +338,7 @@ class DataBridge:
                 type_mode=self._state.type_mode,
                 ptt_active=self._state.ptt_active,
                 chat_active=self._state.chat_active,
+                chat_accumulating=self._state.chat_accumulating,
                 error=self._state.error
             )
 

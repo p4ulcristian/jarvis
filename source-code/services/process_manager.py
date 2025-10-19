@@ -61,24 +61,14 @@ class ProcessManager:
             logger.error(f"Keyboard listener not found at {script_path}")
             return False
 
-        logger.info("=" * 60)
-        logger.info("JARVIS - Keyboard Hotkey Setup")
-        logger.info("=" * 60)
-        logger.info("Keyboard listener requires sudo access.")
-        logger.info("You may be prompted for your password.")
-        logger.info("=" * 60)
-
         try:
-            # Request sudo access first (caches credentials)
-            logger.info("Requesting sudo access...")
+            # Verify sudo access (should already be cached from main.py)
             result = subprocess.run(['sudo', '-v'], check=False, capture_output=True, text=True)
 
             if result.returncode != 0:
-                logger.error("Failed to get sudo access")
+                logger.error("Failed to verify sudo access")
                 logger.error(f"Error: {result.stderr}")
                 return False
-
-            logger.info("✓ Sudo access granted")
 
             # Clean up old event file (may be owned by root from previous run)
             try:

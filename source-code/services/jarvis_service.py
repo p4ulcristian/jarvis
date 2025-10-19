@@ -57,6 +57,7 @@ class JarvisService:
         # Chat mode components
         self.conversation_manager = None
         self.response_processor = None
+        self.accumulated_chat_text = []  # Buffer for accumulating chat transcriptions
 
         # State management
         self.shutdown = False
@@ -205,6 +206,72 @@ class JarvisService:
             self.logger.warning(f"Could not initialize Claude Code handler: {e}")
             if self.data_bridge:
                 self.data_bridge.send_log("WARNING", f"Claude Code initialization failed: {e}")
+            return False
+
+    def ensure_ollama_running(self) -> bool:
+        """
+        Ensure Ollama service is running, start it if needed
+
+        Returns:
+            True if Ollama is running or successfully started, False otherwise
+        """
+        import subprocess
+        import time
+
+        try:
+            # Check if Ollama is already running
+            result = subprocess.run(
+                ['pgrep', '-f', 'ollama serve'],
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode == 0:
+                self.logger.info("Ollama is already running")
+                return True
+
+            # Ollama not running - start it
+            self.logger.info("Starting Ollama service...")
+            if self.data_bridge:
+                self.data_bridge.send_log("INFO", "Starting Ollama service...")
+
+            # Start Ollama in background
+            subprocess.Popen(
+                ['ollama', 'serve'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+
+            # Wait for Ollama to be ready (max 5 seconds)
+            for i in range(10):
+                time.sleep(0.5)
+                # Check if it's running
+                check_result = subprocess.run(
+                    ['pgrep', '-f', 'ollama serve'],
+                    capture_output=True,
+                    text=True
+                )
+                if check_result.returncode == 0:
+                    self.logger.info("Ollama service started successfully")
+                    if self.data_bridge:
+                        self.data_bridge.send_log("INFO", "Ollama service started")
+                    return True
+
+            self.logger.warning("Ollama service did not start in time")
+            if self.data_bridge:
+                self.data_bridge.send_log("WARNING", "Ollama startup timeout")
+            return False
+
+        except FileNotFoundError:
+            self.logger.warning("Ollama not installed - install with: curl -fsSL https://ollama.com/install.sh | sh")
+            if self.data_bridge:
+                self.data_bridge.send_log("WARNING", "Ollama not installed")
+            return False
+        except Exception as e:
+            self.logger.warning(f"Could not start Ollama: {e}")
+            if self.data_bridge:
+                self.data_bridge.send_log("WARNING", f"Ollama startup failed: {e}")
             return False
 
     def initialize_chat_mode(self) -> bool:
@@ -520,67 +587,23 @@ class JarvisService:
                                         self.log_conversation(result.text)
                                         self.transcription_buffer.add(result.text)
 
-                                        # Always send to UI
+                                        # Always send to transcription UI
                                         if self.data_bridge:
                                             self.data_bridge.send_transcription(result.text)
+
+                                        # If chat mode is enabled and accumulating, accumulate transcriptions
+                                        if self.conversation_manager and self.response_processor and self.data_bridge:
+                                            state = self.data_bridge.get_state()
+                                            if state.chat_accumulating:
+                                                # Accumulate this transcription
+                                                self.accumulated_chat_text.append(result.text)
+                                                # Send to chat window as user message
+                                                self.data_bridge.send_chat_message("user", result.text)
+                                                self.logger.info(f"Accumulated chat text: '{result.text}'")
 
                                         if not self.config.enable_ui:
                                             timestamp = datetime.now().strftime('%H:%M:%S')
                                             self.logger.info(f"[{timestamp}] {result.text}")
-
-                                        # Check for wake word (chat mode)
-                                        if self.conversation_manager and self.response_processor:
-                                            command = self.conversation_manager.detect_wake_word(result.text)
-                                            if command:
-                                                self.logger.info(f"Wake word detected - command: '{command}'")
-
-                                                # Send user message to chat UI
-                                                if self.data_bridge:
-                                                    self.data_bridge.send_chat_message("user", result.text)
-                                                    self.data_bridge.update_state(chat_active=True)
-
-                                                # Acknowledge via TTS (non-blocking)
-                                                self.response_processor.acknowledge(blocking=False)
-
-                                                # Process command via Qwen Agent (async)
-                                                try:
-                                                    import asyncio
-
-                                                    # Run async chat in sync context
-                                                    loop = asyncio.new_event_loop()
-                                                    asyncio.set_event_loop(loop)
-                                                    try:
-                                                        agent_response = loop.run_until_complete(
-                                                            self.conversation_manager.process_command(command)
-                                                        )
-
-                                                        # Log response
-                                                        self.logger.info(f"Agent response: {agent_response.short_text}")
-
-                                                        # Send assistant response to chat UI
-                                                        if self.data_bridge:
-                                                            backend_used = agent_response.tool_used or "ollama"
-                                                            self.data_bridge.send_chat_message(
-                                                                "jarvis",
-                                                                agent_response.text,
-                                                                backend=backend_used
-                                                            )
-
-                                                        # Speak response via TTS (short version)
-                                                        if agent_response.success and agent_response.short_text:
-                                                            self.response_processor.speak_response(
-                                                                full_response=agent_response.text,
-                                                                short_response=agent_response.short_text,
-                                                                blocking=False
-                                                            )
-                                                    finally:
-                                                        loop.close()
-
-                                                except Exception as e:
-                                                    self.logger.error(f"Error processing chat command: {e}", exc_info=True)
-                                                    if self.data_bridge:
-                                                        self.data_bridge.send_log("ERROR", f"Chat error: {e}")
-                                                        self.data_bridge.update_state(chat_active=False)
 
                                     elif not result.success:
                                         # Log transcription errors
@@ -589,6 +612,101 @@ class JarvisService:
                                                 f"Transcription failed: {result.error} "
                                                 f"(latency: {result.latency:.1f}s)"
                                             )
+
+                            # Check for chat button triggers - starts accumulating mode
+                            if self.conversation_manager and self.response_processor and self.data_bridge:
+                                chat_trigger = self.data_bridge.get_chat_trigger(timeout=0.001)
+                                if chat_trigger:
+                                    # Clear accumulated text buffer and start chat session
+                                    self.accumulated_chat_text.clear()
+                                    self.logger.info("Chat button pressed - starting chat session (SEND button now active)")
+
+                            # Check for send button triggers - sends accumulated text to agent
+                            if self.conversation_manager and self.response_processor and self.data_bridge:
+                                send_trigger = self.data_bridge.get_send_trigger(timeout=0.001)
+                                if send_trigger:
+                                    # Get accumulated text
+                                    if self.accumulated_chat_text:
+                                        command = " ".join(self.accumulated_chat_text).strip()
+                                        # Clear buffer immediately for next question
+                                        self.accumulated_chat_text.clear()
+                                    else:
+                                        command = "Hello"  # Default greeting if no accumulated text
+
+                                    self.logger.info(f"Send button pressed - sending: '{command}'")
+
+                                    # Update chat state - keep accumulating mode active for next question
+                                    if self.data_bridge:
+                                        self.data_bridge.update_state(chat_active=True)
+                                        # Don't disable chat_accumulating - it stays True for the session
+
+                                    # Acknowledge via TTS (non-blocking) - optional "I hear you"
+                                    # Comment out if you don't want the TTS acknowledgment:
+                                    # self.response_processor.acknowledge(blocking=False)
+
+                                    # Process command via Qwen Agent (async with streaming)
+                                    try:
+                                        import asyncio
+                                        import uuid
+
+                                        # Generate unique message ID for streaming
+                                        message_id = str(uuid.uuid4())
+                                        full_response = ""
+
+                                        # Run async chat in sync context
+                                        loop = asyncio.new_event_loop()
+                                        asyncio.set_event_loop(loop)
+                                        try:
+                                            # Get streaming response
+                                            stream_generator = self.conversation_manager.process_command_stream(command)
+
+                                            # Process streaming chunks - accumulate full response
+                                            async def process_stream():
+                                                nonlocal full_response
+                                                async for chunk in stream_generator:
+                                                    full_response += chunk
+                                                    # Just accumulate, don't send individual chunks to UI
+
+                                            loop.run_until_complete(process_stream())
+
+                                            # Send complete response to chat window once
+                                            if self.data_bridge and full_response:
+                                                self.data_bridge.send_chat_message(
+                                                    role="jarvis",
+                                                    text=full_response,
+                                                    backend="ollama"
+                                                )
+
+                                            # Log response
+                                            self.logger.info(f"Agent response (streamed): {full_response[:100]}...")
+
+                                            # Speak response via TTS (short version)
+                                            # Extract short version from full response
+                                            import re
+                                            sentences = re.split(r'[.!?]+', full_response)
+                                            sentences = [s.strip() for s in sentences if s.strip()]
+                                            short_response = '. '.join(sentences[:self.config.max_tts_sentences])
+                                            if short_response and not short_response.endswith(('.', '!', '?')):
+                                                short_response += '.'
+
+                                            if short_response:
+                                                self.response_processor.speak_response(
+                                                    full_response=full_response,
+                                                    short_response=short_response,
+                                                    blocking=False
+                                                )
+
+                                            # Update state - ready for next question
+                                            if self.data_bridge:
+                                                self.data_bridge.update_state(chat_active=False)
+                                        finally:
+                                            loop.close()
+
+                                    except Exception as e:
+                                        self.logger.error(f"Error processing chat command: {e}", exc_info=True)
+                                        if self.data_bridge:
+                                            self.data_bridge.send_log("ERROR", f"Chat error: {e}")
+                                            self.data_bridge.update_state(chat_active=False)
 
                         # Periodic metrics logging
                         current_time = time.time()
@@ -624,6 +742,9 @@ class JarvisService:
             Path(self.config.improved_log_file).write_text('')
         except Exception as e:
             self.logger.warning(f"Could not clear log files: {e}")
+
+        # Ensure Ollama is running (needed for chat mode and other features)
+        self.ensure_ollama_running()
 
         # Initialize keyboard typer
         self.initialize_keyboard_typer()

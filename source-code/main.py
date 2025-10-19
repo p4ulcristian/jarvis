@@ -142,6 +142,21 @@ def main():
     """
     global _app_context
 
+    # REQUEST SUDO ACCESS FIRST - before any heavy imports or initialization
+    # This ensures password prompt appears immediately at startup
+    try:
+        import subprocess
+        logger.info("=" * 60)
+        logger.info("JARVIS - Requesting sudo access for keyboard listener")
+        logger.info("You may be prompted for your password...")
+        logger.info("=" * 60)
+        result = subprocess.run(['sudo', '-v'], check=False, capture_output=True, text=True)
+        if result.returncode != 0:
+            logger.warning("Failed to get sudo access - Type Mode will not work")
+            logger.warning(f"Error: {result.stderr}")
+    except Exception as e:
+        logger.warning(f"Could not request sudo access: {e}")
+
     # Initialize application context
     _app_context = ApplicationContext()
 
@@ -158,7 +173,7 @@ def main():
         process_manager = ProcessManager()
         _app_context.process_manager = process_manager
 
-        # Start keyboard listener with sudo
+        # Start keyboard listener with sudo (should use cached credentials now)
         logger.info("Starting keyboard listener...")
         if not process_manager.start_keyboard_listener():
             logger.warning("Failed to start keyboard listener - Type Mode will not work")

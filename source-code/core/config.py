@@ -42,8 +42,8 @@ class Config:
         self.device_sample_rate = self._get_int('DEVICE_SAMPLE_RATE', 48000)
 
         # VAD Configuration
-        self.silence_threshold = self._get_int('SILENCE_THRESHOLD', 100)  # Increased from 10 to 100
-        self.min_speech_ratio = self._get_float('MIN_SPEECH_RATIO', 0.01)  # Increased from 0.0001 to 0.01 (1%)
+        self.silence_threshold = self._get_int('SILENCE_THRESHOLD', 80)  # Lowered from 100 to 80 for better wake word detection
+        self.min_speech_ratio = self._get_float('MIN_SPEECH_RATIO', 0.005)  # Lowered from 0.01 to 0.005 (0.5%) for better sensitivity
         self.frame_len = self._get_float('FRAME_LEN', 1.6)
 
         # Model Configuration
@@ -55,11 +55,6 @@ class Config:
         self.canary_target_lang = self._get_str('CANARY_TARGET_LANG', 'en')  # en, de, fr, es
         self.canary_pnc = self._get_str('CANARY_PNC', 'yes')  # yes/no for punctuation and capitalization
         self.canary_beam_size = self._get_int('CANARY_BEAM_SIZE', 1)  # 1 for greedy decoding (fastest)
-
-        # Streaming Configuration
-        self.streaming_chunk_size = self._get_int('STREAMING_CHUNK_SIZE', 8)  # Number of frames per chunk
-        self.streaming_left_context = self._get_int('STREAMING_LEFT_CONTEXT', 32)  # Left context frames
-        self.decoder_type = self._get_str('DECODER_TYPE', 'rnnt')  # 'rnnt' or 'ctc'
 
         # Paths
         self.log_file = self._get_str('LOG_FILE', 'data/chat.txt')
