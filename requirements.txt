@@ -1,0 +1,14 @@
+# JARVIS - Simple Voice Assistant
+# Core dependencies
+
+# NeMo for Parakeet-TDT-0.6B-v3
+nemo_toolkit[asr]>=2.0.0
+torch>=2.5.0
+torchaudio>=2.5.0
+
+# Audio
+sounddevice>=0.5.0
+numpy>=1.26.0
+
+# CUDA optimization (12.x for NeMo CUDA graphs compatibility)
+cuda-python>=12.3,<13.0
