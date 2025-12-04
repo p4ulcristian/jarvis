@@ -1,0 +1,13 @@
+[project]
+name = "jarvis"
+version = "0.1.0"
+description = "Push-to-talk speech-to-text daemon for Wayland"
+requires-python = ">=3.10"
+dependencies = [
+    "nemo_toolkit[asr]",
+    "sounddevice",
+    "numpy",
+]
+
+[project.scripts]
+jarvis = "jarvis.daemon:main"
