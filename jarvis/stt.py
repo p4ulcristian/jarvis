@@ -16,5 +16,8 @@ class SpeechToText:
     def transcribe(self, audio: np.ndarray) -> str:
         result = self.model.transcribe([audio])
         if result and len(result) > 0:
-            return result[0].strip()
+            hyp = result[0]
+            # Handle Hypothesis object or plain string
+            text = hyp.text if hasattr(hyp, 'text') else str(hyp)
+            return text.strip()
         return ""
