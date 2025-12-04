@@ -14,50 +14,25 @@ Push-to-talk speech-to-text for Wayland. Hold CapsLock, speak, release, text app
 
 ```bash
 # System deps (Arch)
-sudo pacman -S keyd wtype wl-clipboard python
+sudo pacman -S keyd wtype wl-clipboard
 
-# Enable keyd
-sudo systemctl enable --now keyd
+# Clone and install
+git clone https://github.com/p4ulcristian/jarvis.git
+cd jarvis
+uv venv && uv pip install -e .
 
-# Install jarvis
-pip install -e .
-```
-
-## Setup
-
-### keyd
-
-```bash
-sudo cp config/keyd.conf /etc/keyd/default.conf
-sudo systemctl restart keyd
-```
-
-### Scripts
-
-```bash
-sudo cp scripts/jarvis-start scripts/jarvis-stop /usr/local/bin/
-```
-
-### Systemd (optional)
-
-```bash
-cp config/jarvis.service ~/.config/systemd/user/
-systemctl --user enable --now jarvis
+# Run install script
+./install.sh
 ```
 
 ## Usage
 
-Run manually:
-```bash
-python -m jarvis.daemon
-```
-
-Or with systemd:
+Start the service:
 ```bash
 systemctl --user start jarvis
 ```
 
-Then hold CapsLock and speak.
+Then hold CapsLock and speak. Text appears at cursor.
 
 ## Config
 
