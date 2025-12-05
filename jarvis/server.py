@@ -139,6 +139,9 @@ class JarvisServer:
         """Background thread that plays audio from the queue."""
         while True:
             audio_bytes = self._audio_queue.get()
+            if audio_bytes is None:  # Poison pill to clear queue
+                self._audio_queue.task_done()
+                continue
             try:
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=True) as f:
                     f.write(audio_bytes)
@@ -151,6 +154,18 @@ class JarvisServer:
                 print(f"Playback error: {e}", flush=True)
             finally:
                 self._audio_queue.task_done()
+
+    def stop_playback(self):
+        """Stop all speech - kill mpv and clear queue."""
+        # Kill any running mpv processes
+        subprocess.run(['pkill', '-9', 'mpv'], capture_output=True)
+        # Clear the queue
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+                self._audio_queue.task_done()
+            except queue.Empty:
+                break
 
     def queue_speak(self, text: str, voice: str = KOKORO_VOICE, speed: float = 1.0):
         """Request TTS from Kokoro and queue for playback."""
@@ -297,7 +312,8 @@ def ptt_stop():
 
 
 def handle_ptt_press():
-    """CapsLock press - start recording."""
+    """CapsLock press - stop any speech and start recording."""
+    server.stop_playback()
     server.start_recording()
 
 
