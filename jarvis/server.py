@@ -69,8 +69,12 @@ def _quiet():
     return Quiet()
 
 
+kokoro_process = None  # Track if we started Kokoro
+
+
 def ensure_kokoro_running():
     """Start Kokoro TTS server if not already running."""
+    global kokoro_process
     try:
         resp = requests.get(f"{KOKORO_URL}/health", timeout=1)
         if resp.status_code == 200:
@@ -80,7 +84,7 @@ def ensure_kokoro_running():
         pass
 
     print("Starting Kokoro TTS server...", flush=True)
-    subprocess.Popen(
+    kokoro_process = subprocess.Popen(
         [str(KOKORO_START_SCRIPT)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -102,17 +106,34 @@ def ensure_kokoro_running():
     return False
 
 
+def stop_kokoro():
+    """Stop Kokoro TTS if we started it."""
+    global kokoro_process
+    if kokoro_process is not None:
+        print("Stopping Kokoro TTS...", flush=True)
+        try:
+            os.killpg(os.getpgid(kokoro_process.pid), signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+        kokoro_process = None
+
+
 class JarvisServer:
-    def __init__(self):
+    def __init__(self, load_stt=True):
         self.stt_model = None
+        self.stt_ready = threading.Event()
         self.recorder = AudioRecorder()
         self.recording = False
-        self._load_stt_model()
 
         # Audio playback queue
         self._audio_queue = queue.Queue()
         self._playback_thread = threading.Thread(target=self._playback_worker, daemon=True)
         self._playback_thread.start()
+
+        # Load STT model in background
+        if load_stt:
+            self._stt_thread = threading.Thread(target=self._load_stt_model, daemon=True)
+            self._stt_thread.start()
 
     def _playback_worker(self):
         """Background thread that plays audio from the queue."""
@@ -133,10 +154,11 @@ class JarvisServer:
 
     def queue_speak(self, text: str, voice: str = KOKORO_VOICE, speed: float = 1.0):
         """Request TTS from Kokoro and queue for playback."""
-        # Clean text: replace newlines/tabs with spaces, collapse multiple spaces
         import re
-        # Handle both literal \n strings and actual newlines
-        text = text.replace('\\n', ' ').replace('\\r', ' ').replace('\\t', ' ')
+        # Remove backslash escape sequences (e.g. \n \t \r) and stray backslashes
+        text = re.sub(r'\\[nrt]', ' ', text)
+        text = re.sub(r'\\', '', text)
+        # Replace whitespace and collapse spaces
         text = re.sub(r'[\n\r\t]+', ' ', text)
         text = re.sub(r' +', ' ', text).strip()
         if not text:
@@ -157,11 +179,14 @@ class JarvisServer:
 
     def _load_stt_model(self):
         print("Loading STT model (Canary)...", flush=True)
-        with _quiet():
-            self.stt_model = EncDecMultiTaskModel.from_pretrained(STT_MODEL, map_location='cpu')
-            self.stt_model = self.stt_model.half().cuda()
-            self.stt_model.eval()
-        print("STT ready", flush=True)
+        try:
+            with _quiet():
+                self.stt_model = EncDecMultiTaskModel.from_pretrained(STT_MODEL, map_location='cpu')
+                self.stt_model = self.stt_model.half().cuda()
+                self.stt_model.eval()
+            print("STT ready", flush=True)
+        finally:
+            self.stt_ready.set()
 
     def cleanup(self):
         """Release STT model and free CUDA memory."""
@@ -174,7 +199,12 @@ class JarvisServer:
         print("Cleanup complete", flush=True)
 
     def transcribe(self, audio: np.ndarray) -> str:
-        """Transcribe audio to text."""
+        """Transcribe audio to text. Blocks until STT model is ready."""
+        if not self.stt_ready.wait(timeout=60):
+            print("STT model not ready", flush=True)
+            return ""
+        if self.stt_model is None:
+            return ""
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=True) as f:
             sf.write(f.name, audio, STT_SAMPLE_RATE)
             with _quiet():
@@ -212,7 +242,10 @@ server = None
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({
+        "status": "ok",
+        "stt_ready": server.stt_ready.is_set() if server else False
+    })
 
 
 @app.route('/speak', methods=['POST'])
@@ -279,6 +312,7 @@ def shutdown(signum, frame):
     print("\nShutting down...", flush=True)
     if server:
         server.cleanup()
+    stop_kokoro()
     PID_FILE.unlink(missing_ok=True)
     sys.exit(0)
 
@@ -288,9 +322,6 @@ def main():
 
     # Write PID file
     PID_FILE.write_text(str(os.getpid()))
-
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
 
     ptt_listener = None
     try:
@@ -310,12 +341,23 @@ def main():
         print(f"Jarvis server running on http://{HOST}:{PORT}", flush=True)
         print("Hold CapsLock to record", flush=True)
 
-        app.run(host=HOST, port=PORT, threaded=True, use_reloader=False)
+        # Run Flask in a background thread so main thread handles signals
+        flask_thread = threading.Thread(
+            target=lambda: app.run(host=HOST, port=PORT, threaded=True, use_reloader=False),
+            daemon=True
+        )
+        flask_thread.start()
+
+        # Main thread waits for signals
+        signal.signal(signal.SIGTERM, shutdown)
+        signal.signal(signal.SIGINT, shutdown)
+        signal.pause()
     finally:
         if ptt_listener:
             ptt_listener.stop()
         if server:
             server.cleanup()
+        stop_kokoro()
         PID_FILE.unlink(missing_ok=True)
 
 
