@@ -44,6 +44,15 @@ from iris.ptt import PTTListener
 HOST = "127.0.0.1"
 PORT = 8765
 PID_FILE = Path("/tmp/iris.pid")
+STATE_FILE = Path("/tmp/iris-state")
+
+
+def set_state(state: str):
+    """Update state file for bubble to read."""
+    try:
+        STATE_FILE.write_text(state)
+    except Exception:
+        pass
 
 # Kokoro TTS config
 KOKORO_URL = "http://127.0.0.1:7123"
@@ -180,6 +189,7 @@ class IrisServer:
                 self._audio_queue.task_done()
                 continue
             try:
+                set_state("speaking")
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=True) as f:
                     f.write(audio_bytes)
                     f.flush()
@@ -190,6 +200,7 @@ class IrisServer:
             except Exception as e:
                 print(f"Playback error: {e}", flush=True)
             finally:
+                set_state("ready")
                 self._audio_queue.task_done()
 
     def stop_playback(self):
@@ -251,6 +262,7 @@ class IrisServer:
                 self.stt_model.eval()
             print("STT ready", flush=True)
             print("👂 Ready to listen", flush=True)
+            set_state("ready")
         finally:
             self.stt_ready.set()
 
@@ -392,6 +404,7 @@ def shutdown(signum, frame):
     stop_bubble()
     stop_kokoro()
     PID_FILE.unlink(missing_ok=True)
+    STATE_FILE.unlink(missing_ok=True)
     sys.exit(0)
 
 
@@ -401,15 +414,16 @@ def main():
     # Write PID file
     PID_FILE.write_text(str(os.getpid()))
 
+    # Set loading state and start bubble FIRST
+    set_state("loading")
+    start_bubble()
+
     ptt_listener = None
     try:
         # Start Kokoro TTS if needed
         ensure_kokoro_running()
 
-        # Start bubble overlay
-        start_bubble()
-
-        # Load STT model
+        # Load STT model (will set state to "ready" when done)
         server = IrisServer()
 
         # Start PTT listener (evdev-based, no device grab)
@@ -441,6 +455,7 @@ def main():
         stop_bubble()
         stop_kokoro()
         PID_FILE.unlink(missing_ok=True)
+        STATE_FILE.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
