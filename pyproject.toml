@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Push-to-talk speech-to-text daemon for Wayland"
 requires-python = ">=3.10"
 dependencies = [
-    "nemo_toolkit[asr]",
+    "nemo_toolkit[asr,tts]",
     "sounddevice",
     "numpy",
     "evdev",
