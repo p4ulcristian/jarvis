@@ -8,10 +8,10 @@ MODEL_NAME = "nvidia/parakeet-tdt-0.6b-v2"
 
 class SpeechToText:
     def __init__(self, model_name: str = MODEL_NAME):
-        print(f"Loading model: {model_name}")
+        print(f"Loading model: {model_name}", flush=True)
         self.model = nemo_asr.models.ASRModel.from_pretrained(model_name)
         self.model.eval()
-        print("Model loaded")
+        print("Model loaded", flush=True)
 
     def transcribe(self, audio: np.ndarray) -> str:
         result = self.model.transcribe([audio])

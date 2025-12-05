@@ -7,6 +7,7 @@ dependencies = [
     "nemo_toolkit[asr]",
     "sounddevice",
     "numpy",
+    "evdev",
 ]
 
 [project.scripts]
