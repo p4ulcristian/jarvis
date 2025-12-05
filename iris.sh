@@ -11,16 +11,6 @@ PID_FILE="/tmp/iris.pid"
 LOG_FILE="$HOME/.local/share/iris/logs.txt"
 mkdir -p "$(dirname "$LOG_FILE")"
 
-# Check if already running
-if [ -f "$PID_FILE" ]; then
-    PID=$(cat "$PID_FILE")
-    if kill -0 "$PID" 2>/dev/null; then
-        echo "Iris is already running (PID: $PID)"
-        echo "Use 'iris stop' to stop it, or 'iris logs' to view logs"
-        exit 0
-    fi
-fi
-
 # Handle commands
 case "${1:-start}" in
     stop)
@@ -46,7 +36,15 @@ case "${1:-start}" in
         exit 0
         ;;
     start|"")
-        # Continue to start
+        # Check if already running (only for start command)
+        if [ -f "$PID_FILE" ]; then
+            PID=$(cat "$PID_FILE")
+            if kill -0 "$PID" 2>/dev/null; then
+                echo "Iris is already running (PID: $PID)"
+                echo "Use 'iris stop' to stop it, or 'iris logs' to view logs"
+                exit 0
+            fi
+        fi
         ;;
     *)
         echo "Usage: iris [start|stop|logs|status]"

@@ -88,6 +88,7 @@ BUBBLE_SCRIPT = Path(__file__).parent / "bubble.py"
 def ensure_kokoro_running():
     """Start Kokoro TTS server if not already running."""
     global kokoro_process
+    set_state("loading:tts")
     try:
         resp = requests.get(f"{KOKORO_URL}/health", timeout=1)
         if resp.status_code == 200:
@@ -254,6 +255,7 @@ class IrisServer:
             print(f"TTS error: {e}", flush=True)
 
     def _load_stt_model(self):
+        set_state("loading:stt")
         print("Loading STT model (Canary)...", flush=True)
         try:
             with _quiet():
@@ -262,8 +264,11 @@ class IrisServer:
                 self.stt_model.eval()
             print("STT ready", flush=True)
             print("👂 Ready to listen", flush=True)
-            set_state("ready")
+        except Exception as e:
+            print(f"STT failed to load: {e}", flush=True)
+            self.stt_model = None
         finally:
+            set_state("ready")
             self.stt_ready.set()
 
     def cleanup(self):

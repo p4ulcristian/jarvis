@@ -30,6 +30,9 @@ DARK_PURPLE = (0.15, 0.05, 0.2)
 GOLD = (1.0, 0.85, 0.0)
 GOLD_DARK = (0.8, 0.6, 0.0)
 WARM_ORANGE = (1.0, 0.6, 0.2)
+GRAY_LIGHT = (0.5, 0.5, 0.55)
+GRAY_MID = (0.35, 0.35, 0.4)
+GRAY_DARK = (0.25, 0.25, 0.3)
 
 # X button settings
 X_SIZE = 12
@@ -58,10 +61,12 @@ class IrisBubble(Gtk.Application):
         self.window = None
         self.drawing_area = None
         self.pulse_phase = 0.0
-        self.loading_phase = 0.0
+        self.loading_dots = 0      # For "Loading..." animation
+        self.dot_counter = 0       # Frame counter for dot animation
         self.is_listening = False  # User speaking (CapsLock)
         self.is_speaking = False   # Iris speaking (TTS)
         self.is_loading = True     # Model loading
+        self.loading_what = ""     # What's being loaded (tts, stt)
         self.animation_id = None
         self.evdev_thread = None
         self.state_thread = None
@@ -149,7 +154,11 @@ class IrisBubble(Gtk.Application):
             try:
                 for event in device.read_loop():
                     if event.type == ecodes.EV_KEY and event.code == ecodes.KEY_CAPSLOCK:
-                        self.is_listening = event.value == 1
+                        # value: 0=release, 1=press, 2=repeat (ignore repeat)
+                        if event.value == 1:
+                            self.is_listening = True
+                        elif event.value == 0:
+                            self.is_listening = False
             except Exception as e:
                 print(f"Evdev error: {e}", flush=True)
 
@@ -164,10 +173,16 @@ class IrisBubble(Gtk.Application):
                 try:
                     if STATE_FILE.exists():
                         state = STATE_FILE.read_text().strip()
-                        self.is_loading = state == "loading"
+                        if state.startswith("loading:"):
+                            self.is_loading = True
+                            self.loading_what = state.split(":")[1].upper()
+                        else:
+                            self.is_loading = state == "loading"
+                            self.loading_what = ""
                         self.is_speaking = state == "speaking"
                     else:
                         self.is_loading = True
+                        self.loading_what = ""
                 except Exception:
                     pass
                 time.sleep(0.1)
@@ -176,19 +191,21 @@ class IrisBubble(Gtk.Application):
         self.state_thread.start()
 
     def animate(self):
-        # Loading animation (slow rotation)
-        self.loading_phase += 0.03
-        if self.loading_phase > 2 * math.pi:
-            self.loading_phase -= 2 * math.pi
-
-        # Active animation (faster pulse)
-        if self.is_listening or self.is_speaking:
-            self.pulse_phase += 0.15
+        # Pulse animation for all active states (loading, listening, speaking)
+        if self.is_listening or self.is_speaking or self.is_loading:
+            self.pulse_phase += 0.1 if self.is_loading else 0.15
             if self.pulse_phase > 2 * math.pi:
                 self.pulse_phase -= 2 * math.pi
         else:
             if self.pulse_phase > 0:
                 self.pulse_phase = max(0, self.pulse_phase - 0.08)
+
+        # Animate loading dots (cycle every ~500ms at 60fps)
+        if self.is_loading:
+            self.dot_counter += 1
+            if self.dot_counter >= 30:  # ~500ms
+                self.dot_counter = 0
+                self.loading_dots = (self.loading_dots + 1) % 4  # 0, 1, 2, 3 dots
 
         self.drawing_area.queue_draw()
         return True
@@ -203,7 +220,7 @@ class IrisBubble(Gtk.Application):
         cr.paint()
         cr.set_operator(1)
 
-        # Determine colors based on state
+        # Determine colors based on state (listening > speaking > loading > idle)
         if self.is_listening:
             primary = NEON_CYAN
             secondary = ELECTRIC_BLUE
@@ -212,29 +229,17 @@ class IrisBubble(Gtk.Application):
             primary = GOLD
             secondary = GOLD_DARK
             accent = WARM_ORANGE
+        elif self.is_loading:
+            primary = GRAY_LIGHT
+            secondary = GRAY_MID
+            accent = GRAY_DARK
         else:
             primary = NEON_MAGENTA
             secondary = DARK_PURPLE
             accent = NEON_PINK
 
-        # === LOADING STATE ===
-        if self.is_loading and not self.is_listening:
-            # Rotating dots around the bubble
-            num_dots = 8
-            dot_radius = 3
-            orbit_radius = radius + 12
-            for i in range(num_dots):
-                angle = self.loading_phase + (i * 2 * math.pi / num_dots)
-                dx = cx + math.cos(angle) * orbit_radius
-                dy = cy + math.sin(angle) * orbit_radius
-                # Fade dots based on position
-                alpha = 0.3 + 0.5 * ((math.sin(angle - self.loading_phase * 2) + 1) / 2)
-                cr.set_source_rgba(*NEON_CYAN, alpha)
-                cr.arc(dx, dy, dot_radius, 0, 2 * math.pi)
-                cr.fill()
-
-        # === ACTIVE STATE (listening or speaking) ===
-        if self.is_listening or self.is_speaking or self.pulse_phase > 0:
+        # === ACTIVE STATE (listening, speaking, or loading) ===
+        if self.is_listening or self.is_speaking or self.is_loading or self.pulse_phase > 0:
             pulse = (math.sin(self.pulse_phase) + 1) / 2
             pulse2 = (math.sin(self.pulse_phase * 2) + 1) / 2
 
@@ -267,6 +272,8 @@ class IrisBubble(Gtk.Application):
             pattern = cairo.RadialGradient(cx - radius * 0.3, cy - radius * 0.3, 0, cx, cy, radius)
             if self.is_speaking:
                 pattern.add_color_stop_rgba(0, 1.0, 0.95, 0.7, 1.0)  # Warm center
+            elif self.is_loading and not self.is_listening:
+                pattern.add_color_stop_rgba(0, 0.6, 0.6, 0.65, 1.0)  # Gray center
             else:
                 pattern.add_color_stop_rgba(0, 0.7, 0.9, 1.0, 1.0)  # Cool center
             pattern.add_color_stop_rgba(0.3, *primary, 1.0)
@@ -277,7 +284,12 @@ class IrisBubble(Gtk.Application):
             cr.fill()
 
             # Inner shine
-            shine_color = (1.0, 0.95, 0.8) if self.is_speaking else (0.8, 0.95, 1.0)
+            if self.is_speaking:
+                shine_color = (1.0, 0.95, 0.8)  # Warm
+            elif self.is_loading and not self.is_listening:
+                shine_color = (0.8, 0.8, 0.85)  # Gray
+            else:
+                shine_color = (0.8, 0.95, 1.0)  # Cool
             cr.set_source_rgba(*shine_color, 0.5 + pulse * 0.3)
             cr.arc(cx - radius * 0.25, cy - radius * 0.25, radius * 0.2, 0, 2 * math.pi)
             cr.fill()
@@ -311,7 +323,13 @@ class IrisBubble(Gtk.Application):
             cr.fill()
 
         # === LABEL with dark background ===
-        label_text = "Iris"
+        if self.is_loading and not self.is_listening:
+            if self.loading_what:
+                label_text = f"{self.loading_what}" + "." * self.loading_dots
+            else:
+                label_text = "Loading" + "." * self.loading_dots
+        else:
+            label_text = "Iris"
         label_y = cy + radius + 28  # Lower position
 
         cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
@@ -321,15 +339,15 @@ class IrisBubble(Gtk.Application):
         text_y = label_y
 
         # Dark background pill
-        padding_x = 8
-        padding_y = 4
+        padding_x = 12
+        padding_y = 6
         bg_x = text_x - padding_x
         bg_y = text_y - extents.height - padding_y + 2
         bg_w = extents.width + padding_x * 2
         bg_h = extents.height + padding_y * 2
         bg_radius = bg_h / 2
 
-        cr.set_source_rgba(0, 0, 0, 0.6)
+        cr.set_source_rgba(0, 0, 0, 0.25)
         # Draw rounded rectangle
         cr.new_path()
         cr.arc(bg_x + bg_radius, bg_y + bg_radius, bg_radius, math.pi, 1.5 * math.pi)
@@ -339,14 +357,15 @@ class IrisBubble(Gtk.Application):
         cr.close_path()
         cr.fill()
 
-        # Text glow
-        label_color = GOLD if self.is_speaking else NEON_CYAN
-        for alpha in [0.15, 0.25, 0.4]:
-            cr.set_source_rgba(*label_color, alpha)
-            cr.move_to(text_x, text_y)
-            cr.show_text(label_text)
+        # Label color based on state
+        if self.is_speaking:
+            label_color = GOLD
+        elif self.is_loading and not self.is_listening:
+            label_color = GRAY_LIGHT
+        else:
+            label_color = NEON_CYAN
 
-        # Main text
+        # Main text (no glow for cleaner look)
         cr.set_source_rgba(*label_color, 0.95)
         cr.move_to(text_x, text_y)
         cr.show_text(label_text)
