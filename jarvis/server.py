@@ -164,6 +164,9 @@ class JarvisServer:
         self._playback_thread = threading.Thread(target=self._playback_worker, daemon=True)
         self._playback_thread.start()
 
+        # Track CapsLock state to block new speech while held
+        self.caps_lock_held = False
+
         # Load STT model in background
         if load_stt:
             self._stt_thread = threading.Thread(target=self._load_stt_model, daemon=True)
@@ -203,6 +206,10 @@ class JarvisServer:
 
     def queue_speak(self, text: str, voice: str = KOKORO_VOICE, speed: float = 1.0):
         """Request TTS from Kokoro and queue for playback."""
+        # Don't queue new speech while CapsLock is held (user is speaking)
+        if self.caps_lock_held:
+            return
+
         import re
         # Remove backslash escape sequences (e.g. \n \t \r) and stray backslashes
         text = re.sub(r'\\[nrt]', ' ', text)
@@ -348,15 +355,25 @@ def ptt_stop():
 
 def handle_ptt_press():
     """CapsLock press - stop any speech and start recording."""
+    server.caps_lock_held = True
     server.stop_playback()
     server.start_recording()
 
 
 def handle_ptt_release():
-    """CapsLock release - stop and transcribe."""
-    text = server.stop_recording()
-    if text:
-        paste_text(text)
+    """CapsLock release - stop and transcribe in background."""
+    server.caps_lock_held = False
+    audio = server.recorder.stop() if server.recording else None
+    server.recording = False
+
+    def process():
+        if audio is not None and len(audio) > 0:
+            text = server.transcribe(audio)
+            if text:
+                print(f"Transcribed: {text}")
+                paste_text(text)
+
+    threading.Thread(target=process, daemon=True).start()
 
 
 def shutdown(signum, frame):
