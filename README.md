@@ -80,6 +80,8 @@ iris.sh
           └── bubble.py (GTK4 overlay)
 ```
 
+**Note:** We use evdev directly for hotkey detection, not keyd. Disable CapsLock toggle in your compositor (e.g., `kb_options = caps:none` in Hyprland).
+
 Models stay loaded in memory for instant response. First startup takes a minute to load.
 
 ## License

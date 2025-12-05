@@ -195,6 +195,11 @@ class IrisServer:
             if item is None:  # Poison pill to clear queue
                 self._audio_queue.task_done()
                 continue
+
+            # Wait for CapsLock to be released before playing
+            while self.caps_lock_held:
+                time.sleep(0.1)
+
             audio_bytes = item
             try:
                 set_state("speaking")
