@@ -163,6 +163,16 @@ class JarvisServer:
             self.stt_model.eval()
         print("STT ready", flush=True)
 
+    def cleanup(self):
+        """Release STT model and free CUDA memory."""
+        print("Cleaning up models...", flush=True)
+        if self.stt_model is not None:
+            del self.stt_model
+            self.stt_model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print("Cleanup complete", flush=True)
+
     def transcribe(self, audio: np.ndarray) -> str:
         """Transcribe audio to text."""
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=True) as f:
@@ -266,6 +276,9 @@ def handle_ptt_release():
 
 
 def shutdown(signum, frame):
+    print("\nShutting down...", flush=True)
+    if server:
+        server.cleanup()
     PID_FILE.unlink(missing_ok=True)
     sys.exit(0)
 
@@ -301,6 +314,8 @@ def main():
     finally:
         if ptt_listener:
             ptt_listener.stop()
+        if server:
+            server.cleanup()
         PID_FILE.unlink(missing_ok=True)
 
 
