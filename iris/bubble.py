@@ -86,6 +86,12 @@ class IrisBubble(Gtk.Application):
         # Volume button
         self.vol_hovered = False
         self.volume = 100  # Current volume (0, 50, 75, 100)
+        # Dragging
+        self.is_dragging = False
+        self.drag_start_margin_top = MARGIN_TOP
+        self.drag_start_margin_right = MARGIN_RIGHT
+        self.margin_top = MARGIN_TOP
+        self.margin_right = MARGIN_RIGHT
 
     def do_activate(self):
         self.window = Gtk.ApplicationWindow(application=self)
@@ -116,6 +122,14 @@ class IrisBubble(Gtk.Application):
         click_controller = Gtk.GestureClick()
         click_controller.connect('pressed', self.on_click)
         self.drawing_area.add_controller(click_controller)
+
+        # Drag gesture for moving the bubble
+        drag_controller = Gtk.GestureDrag()
+        drag_controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        drag_controller.connect('drag-begin', self.on_drag_begin)
+        drag_controller.connect('drag-update', self.on_drag_update)
+        drag_controller.connect('drag-end', self.on_drag_end)
+        self.window.add_controller(drag_controller)  # Add to window, not drawing_area
 
         self.load_css()
         self.start_evdev_listener()
@@ -185,6 +199,51 @@ class IrisBubble(Gtk.Application):
             requests.post("http://127.0.0.1:8765/volume", json={"volume": self.volume}, timeout=1)
         except Exception:
             pass
+
+    def on_drag_begin(self, gesture, start_x, start_y):
+        """Start dragging - capture current margins."""
+        # Don't drag if clicking on X or volume button
+        x_cx, x_cy = self.get_x_center()
+        v_cx, v_cy = self.get_vol_center()
+        dist_x = math.sqrt((start_x - x_cx) ** 2 + (start_y - x_cy) ** 2)
+        dist_v = math.sqrt((start_x - v_cx) ** 2 + (start_y - v_cy) ** 2)
+        if dist_x <= X_HIT_RADIUS or dist_v <= VOL_HIT_RADIUS:
+            gesture.set_state(Gtk.EventSequenceState.DENIED)
+            return
+        # Get current margins from layer-shell
+        self.drag_start_margin_right = LayerShell.get_margin(self.window, LayerShell.Edge.RIGHT)
+        self.drag_start_margin_top = LayerShell.get_margin(self.window, LayerShell.Edge.TOP)
+        self.is_dragging = True
+
+    def on_drag_update(self, gesture, offset_x, offset_y):
+        """Update position while dragging."""
+        if not self.is_dragging:
+            return
+
+        # Get scale factor from widget
+        scale = self.window.get_scale_factor()
+
+        # Apply HiDPI correction
+        phys_x = offset_x * scale
+        phys_y = offset_y * scale
+
+        # Moving right decreases right margin, moving down increases top margin
+        new_right = int(self.drag_start_margin_right - phys_x)
+        new_top = int(self.drag_start_margin_top + phys_y)
+
+        # Clamp to reasonable bounds
+        new_right = max(0, new_right)
+        new_top = max(0, new_top)
+
+        LayerShell.set_margin(self.window, LayerShell.Edge.RIGHT, new_right)
+        LayerShell.set_margin(self.window, LayerShell.Edge.TOP, new_top)
+
+    def on_drag_end(self, gesture, offset_x, offset_y):
+        """Finish dragging."""
+        self.is_dragging = False
+        # Update stored margins
+        self.margin_right = LayerShell.get_margin(self.window, LayerShell.Edge.RIGHT)
+        self.margin_top = LayerShell.get_margin(self.window, LayerShell.Edge.TOP)
 
     def start_evdev_listener(self):
         """Listen for CapsLock (user speaking)."""
