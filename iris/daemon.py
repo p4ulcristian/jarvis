@@ -5,11 +5,11 @@ import signal
 import sys
 from pathlib import Path
 
-from jarvis.audio import AudioRecorder
-from jarvis.stt import SpeechToText
-from jarvis.output import paste_text
+from iris.audio import AudioRecorder
+from iris.stt import SpeechToText
+from iris.output import paste_text
 
-PID_FILE = Path("/tmp/jarvis.pid")
+PID_FILE = Path("/tmp/iris.pid")
 
 
 class Daemon:
@@ -52,7 +52,7 @@ class Daemon:
         signal.signal(signal.SIGTERM, self.shutdown)
         signal.signal(signal.SIGINT, self.shutdown)
 
-        print(f"Jarvis ready (PID: {os.getpid()})", flush=True)
+        print(f"Iris ready (PID: {os.getpid()})", flush=True)
         print("Hold CapsLock to record...", flush=True)
 
         # Keep main thread alive, waiting for signals

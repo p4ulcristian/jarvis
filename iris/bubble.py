@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Jarvis floating bubble overlay using GTK4 + layer-shell."""
+"""Iris floating bubble overlay using GTK4 + layer-shell."""
 
 import gi
 gi.require_version('Gtk', '4.0')
@@ -8,6 +8,8 @@ gi.require_version('Gtk4LayerShell', '1.0')
 from gi.repository import Gtk, Gdk, GLib, Gtk4LayerShell as LayerShell
 from pathlib import Path
 import math
+import os
+import signal
 import threading
 from evdev import InputDevice, ecodes, list_devices
 
@@ -22,6 +24,11 @@ NEON_MAGENTA = (1.0, 0.0, 0.8)
 NEON_PINK = (1.0, 0.2, 0.6)
 ELECTRIC_BLUE = (0.1, 0.5, 1.0)
 DARK_PURPLE = (0.15, 0.05, 0.2)
+
+# X button settings
+X_SIZE = 12  # Size of the X
+X_MARGIN = 8  # Margin from top-right corner
+X_HIT_RADIUS = 15  # Click detection radius
 
 
 def find_keyboard():
@@ -39,15 +46,19 @@ def find_keyboard():
     return None
 
 
-class JarvisBubble(Gtk.Application):
+class IrisBubble(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id='com.jarvis.bubble')
+        super().__init__(application_id='com.iris.bubble')
         self.window = None
         self.drawing_area = None
         self.pulse_phase = 0.0
         self.is_active = False
         self.animation_id = None
         self.evdev_thread = None
+        # Mouse tracking for X button
+        self.mouse_x = -1
+        self.mouse_y = -1
+        self.x_hovered = False
 
     def do_activate(self):
         self.window = Gtk.ApplicationWindow(application=self)
@@ -70,6 +81,17 @@ class JarvisBubble(Gtk.Application):
         self.drawing_area.set_size_request(BUBBLE_SIZE, BUBBLE_SIZE)
         self.drawing_area.set_draw_func(self.draw_bubble)
         self.window.set_child(self.drawing_area)
+
+        # Add mouse motion tracking for hover detection
+        motion_controller = Gtk.EventControllerMotion()
+        motion_controller.connect('motion', self.on_mouse_motion)
+        motion_controller.connect('leave', self.on_mouse_leave)
+        self.drawing_area.add_controller(motion_controller)
+
+        # Add click handler
+        click_controller = Gtk.GestureClick()
+        click_controller.connect('pressed', self.on_click)
+        self.drawing_area.add_controller(click_controller)
 
         # Load CSS
         self.load_css()
@@ -95,6 +117,34 @@ class JarvisBubble(Gtk.Application):
             provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
+
+    def get_x_center(self):
+        """Get the center coordinates of the X button."""
+        return (BUBBLE_SIZE - X_MARGIN - X_SIZE // 2, X_MARGIN + X_SIZE // 2)
+
+    def on_mouse_motion(self, controller, x, y):
+        """Track mouse position for hover effects."""
+        self.mouse_x = x
+        self.mouse_y = y
+        # Check if hovering over X button
+        x_cx, x_cy = self.get_x_center()
+        dist = math.sqrt((x - x_cx) ** 2 + (y - x_cy) ** 2)
+        self.x_hovered = dist <= X_HIT_RADIUS
+
+    def on_mouse_leave(self, controller):
+        """Reset hover state when mouse leaves."""
+        self.mouse_x = -1
+        self.mouse_y = -1
+        self.x_hovered = False
+
+    def on_click(self, gesture, n_press, x, y):
+        """Handle clicks - check if X button was clicked."""
+        x_cx, x_cy = self.get_x_center()
+        dist = math.sqrt((x - x_cx) ** 2 + (y - x_cy) ** 2)
+        if dist <= X_HIT_RADIUS:
+            # X button clicked - send SIGTERM to parent (Iris server)
+            print("X clicked - shutting down Iris", flush=True)
+            os.kill(os.getppid(), signal.SIGTERM)
 
     def start_evdev_listener(self):
         """Start background thread to listen for CapsLock via evdev."""
@@ -215,9 +265,62 @@ class JarvisBubble(Gtk.Application):
             cr.arc(cx - radius * 0.2, cy - radius * 0.2, radius * 0.2, 0, 2 * math.pi)
             cr.fill()
 
+        # Draw "Iris" label below bubble
+        label_text = "Iris"
+        label_y = cy + radius + 18  # Position below bubble
+
+        # Set font
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(13)
+
+        # Get text dimensions for centering
+        extents = cr.text_extents(label_text)
+        text_x = cx - extents.width / 2 - extents.x_bearing
+        text_y = label_y
+
+        # Draw glow effect (multiple layers)
+        for offset, alpha in [(3, 0.15), (2, 0.25), (1, 0.4)]:
+            cr.set_source_rgba(*NEON_CYAN, alpha)
+            cr.move_to(text_x, text_y)
+            cr.show_text(label_text)
+
+        # Draw main text
+        cr.set_source_rgba(*NEON_CYAN, 0.95)
+        cr.move_to(text_x, text_y)
+        cr.show_text(label_text)
+
+        # Draw X button in top-right corner
+        x_cx, x_cy = self.get_x_center()
+        half = X_SIZE // 2
+
+        # X opacity: subtle normally, bright when hovered
+        x_alpha = 0.9 if self.x_hovered else 0.4
+
+        # Draw X with glow when hovered
+        if self.x_hovered:
+            # Glow behind X
+            cr.set_source_rgba(*NEON_MAGENTA, 0.4)
+            cr.arc(x_cx, x_cy, X_HIT_RADIUS, 0, 2 * math.pi)
+            cr.fill()
+
+        # Draw the X lines
+        cr.set_line_width(2.5 if self.x_hovered else 2.0)
+        cr.set_line_cap(1)  # CAIRO_LINE_CAP_ROUND
+        cr.set_source_rgba(1, 1, 1, x_alpha)
+
+        # First line of X (top-left to bottom-right)
+        cr.move_to(x_cx - half, x_cy - half)
+        cr.line_to(x_cx + half, x_cy + half)
+        cr.stroke()
+
+        # Second line of X (top-right to bottom-left)
+        cr.move_to(x_cx + half, x_cy - half)
+        cr.line_to(x_cx - half, x_cy + half)
+        cr.stroke()
+
 
 def main():
-    app = JarvisBubble()
+    app = IrisBubble()
     app.run()
 
 

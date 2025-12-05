@@ -108,7 +108,7 @@ if __name__ == "__main__":
     import subprocess
 
     if len(sys.argv) < 2:
-        print("Usage: python -m jarvis.tts 'text to speak'")
+        print("Usage: python -m iris.tts 'text to speak'")
         sys.exit(1)
 
     text = " ".join(sys.argv[1:])

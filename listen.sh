@@ -1,6 +1,6 @@
 #!/bin/bash
 # Usage: ./listen.sh [audio_file]
-# Records audio (or uses provided file) and sends to Jarvis server for transcription
+# Records audio (or uses provided file) and sends to Iris server for transcription
 
 cd "$(dirname "$0")"
 

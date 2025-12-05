@@ -1,91 +1,87 @@
-# Jarvis
+# Iris
 
-Voice assistant with push-to-talk STT and TTS for Wayland.
+A voice assistant for Wayland. Hold CapsLock to speak, release to transcribe text at your cursor.
 
-## Architecture
+## What It Does
 
-```
-jarvis.sh → server.py (loads STT + TTS models once)
-                ↓
-    ┌───────────┴───────────┐
-    │                       │
-listen.sh              speak.sh
-(STT via /listen)      (TTS via /speak)
-    │                       │
-    └───────────┬───────────┘
-                ↓
-         keyd PTT signals
-      (CapsLock hold/release)
-```
+- **Push-to-Talk** - Hold CapsLock, speak, release. Text appears where your cursor is.
+- **Speech-to-Text** - Uses NVIDIA Canary 1B for fast, accurate transcription
+- **Text-to-Speech** - Natural voice responses via Kokoro TTS
+- **Visual Indicator** - Floating bubble overlay glows when listening
+- **HTTP API** - Control STT/TTS from scripts or other apps
 
 ## Requirements
 
-- Hyprland (or any Wayland compositor)
+- Linux with Wayland (Hyprland, Sway, etc.)
 - NVIDIA GPU with CUDA
 - Python 3.10+
-- keyd, wtype, wl-clipboard, mpv, jq
+- [Kokoro TTS](https://github.com/remsky/Kokoro-FastAPI) server (for speech output)
+
+System packages (Arch):
+```bash
+sudo pacman -S wtype wl-clipboard mpv jq alsa-utils
+```
 
 ## Install
 
 ```bash
-# System deps (Arch)
-sudo pacman -S keyd wtype wl-clipboard mpv jq
-
-# Clone and install
-git clone https://github.com/p4ulcristian/jarvis.git
-cd jarvis
+git clone https://github.com/yourusername/iris.git
+cd iris
 uv venv && uv pip install -e .
-
-# Run install script
-./install.sh
 ```
 
 ## Usage
 
 Start the server:
 ```bash
-./jarvis.sh
-# or
-systemctl --user start jarvis
+./iris.sh
 ```
 
-### Push-to-talk
-Hold CapsLock and speak. Text appears at cursor on release.
+Then hold CapsLock and speak. Your words appear at the cursor when you release.
 
-### CLI
+### Scripts
 
 ```bash
-# Text-to-speech
-./speak.sh "Hello world"
+# Speak text aloud
+./speak.sh "Hello there"
+./speak.sh "Faster speech" 1.3
 
-# Speech-to-text (record until Enter)
+# Transcribe audio file
+./listen.sh recording.wav
+
+# Record and transcribe (press Enter to stop)
 ./listen.sh
-
-# STT from file
-./listen.sh audio.wav
 ```
 
 ### HTTP API
 
 ```bash
-# Health check
+# Check server status
 curl http://127.0.0.1:8765/health
 
-# TTS
+# Text-to-speech
 curl -X POST http://127.0.0.1:8765/speak \
   -H "Content-Type: application/json" \
-  -d '{"text": "Hello"}' -o output.wav
+  -d '{"text": "Hello", "speed": 1.0}'
 
-# STT
+# Speech-to-text
 curl -X POST http://127.0.0.1:8765/listen \
   -F "audio=@recording.wav"
-
-# PTT control
-curl -X POST http://127.0.0.1:8765/ptt/start
-curl -X POST http://127.0.0.1:8765/ptt/stop
 ```
 
-## Config
+## How It Works
 
-Environment variables:
-- `JARVIS_OUTPUT_MODE` - `clipboard` (default) or `type`
+```
+iris.sh
+   └── server.py (loads models, runs HTTP server on :8765)
+          ├── STT: NVIDIA Canary 1B (local)
+          ├── TTS: Kokoro server (localhost:7123)
+          ├── PTT: evdev listens for CapsLock
+          └── bubble.py (GTK4 overlay)
+```
+
+Models stay loaded in memory for instant response. First startup takes a minute to load.
+
+## License
+
+MIT

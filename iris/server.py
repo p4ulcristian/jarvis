@@ -1,4 +1,4 @@
-"""Unified Jarvis server - STT (NeMo) + TTS (Kokoro) with HTTP API."""
+"""Unified Iris server - STT (NeMo) + TTS (Kokoro) with HTTP API."""
 
 import os
 import sys
@@ -36,14 +36,14 @@ logging.disable(logging.NOTSET)
 # Suppress Flask/Werkzeug logs
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
-from jarvis.audio import AudioRecorder
-from jarvis.output import paste_text
-from jarvis.ptt import PTTListener
+from iris.audio import AudioRecorder
+from iris.output import paste_text
+from iris.ptt import PTTListener
 
 # Config
 HOST = "127.0.0.1"
 PORT = 8765
-PID_FILE = Path("/tmp/jarvis.pid")
+PID_FILE = Path("/tmp/iris.pid")
 
 # Kokoro TTS config
 KOKORO_URL = "http://127.0.0.1:7123"
@@ -152,7 +152,7 @@ def stop_bubble():
         bubble_process = None
 
 
-class JarvisServer:
+class IrisServer:
     def __init__(self, load_stt=True):
         self.stt_model = None
         self.stt_ready = threading.Event()
@@ -219,6 +219,15 @@ class JarvisServer:
         text = re.sub(r' +', ' ', text).strip()
         if not text:
             return
+
+        # Convert ALL CAPS words to Title Case (prevents Kokoro from spelling them out)
+        # Keep short words (3 chars or less) as-is since they're likely real acronyms (API, CPU, etc.)
+        def fix_caps(match):
+            word = match.group(0)
+            if len(word) <= 3:
+                return word  # Keep short acronyms
+            return word.capitalize()
+        text = re.sub(r'\b[A-Z]{2,}\b', fix_caps, text)
 
         try:
             resp = requests.post(
@@ -401,7 +410,7 @@ def main():
         start_bubble()
 
         # Load STT model
-        server = JarvisServer()
+        server = IrisServer()
 
         # Start PTT listener (evdev-based, no device grab)
         ptt_listener = PTTListener(
@@ -410,7 +419,7 @@ def main():
         )
         ptt_listener.start()
 
-        print(f"Jarvis server running on http://{HOST}:{PORT}", flush=True)
+        print(f"Iris server running on http://{HOST}:{PORT}", flush=True)
         print("Hold CapsLock to record", flush=True)
 
         # Run Flask in a background thread so main thread handles signals

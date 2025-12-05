@@ -1,7 +1,7 @@
 [project]
-name = "jarvis"
+name = "iris"
 version = "0.1.0"
-description = "Push-to-talk speech-to-text daemon for Wayland"
+description = "Push-to-talk voice assistant for Wayland with STT and TTS"
 requires-python = ">=3.10"
 dependencies = [
     "nemo_toolkit[asr]",
@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-jarvis = "jarvis.server:main"
+iris = "iris.server:main"
 
 [tool.setuptools.packages.find]
-include = ["jarvis*"]
+include = ["iris*"]

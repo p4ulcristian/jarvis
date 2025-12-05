@@ -1,6 +1,6 @@
 #!/bin/bash
 # Usage: ./speak.sh "text to speak" [speed]
-# Sends text to Jarvis server for TTS (server plays audio)
+# Sends text to Iris server for TTS (server plays audio)
 
 SERVER="http://127.0.0.1:8765"
 

@@ -59,7 +59,7 @@ def listen_hotkey(key_code, on_press, on_release):
     caps = device.capabilities()
     # Remove EV_SYN from capabilities (uinput adds it automatically)
     caps.pop(ecodes.EV_SYN, None)
-    ui = UInput(caps, name="jarvis-keyboard")
+    ui = UInput(caps, name="iris-keyboard")
 
     # Store globally for cleanup
     _grabbed_device = device
