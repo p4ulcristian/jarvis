@@ -58,6 +58,7 @@ def set_state(state: str):
 KOKORO_URL = "http://127.0.0.1:7123"
 KOKORO_START_SCRIPT = Path("/home/paul/Work/kokoro/start.sh")
 KOKORO_VOICE = "bf_isabella"
+KOKORO_VOLUME = 70  # Default volume (0-100)
 
 # STT config
 STT_MODEL = "nvidia/canary-1b-v2"
@@ -185,16 +186,17 @@ class IrisServer:
     def _playback_worker(self):
         """Background thread that plays audio from the queue."""
         while True:
-            audio_bytes = self._audio_queue.get()
-            if audio_bytes is None:  # Poison pill to clear queue
+            item = self._audio_queue.get()
+            if item is None:  # Poison pill to clear queue
                 self._audio_queue.task_done()
                 continue
+            audio_bytes, volume = item
             try:
                 set_state("speaking")
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=True) as f:
                     f.write(audio_bytes)
                     f.flush()
-                    subprocess.run(['mpv', '--no-video', '--really-quiet', f.name],
+                    subprocess.run(['mpv', '--no-video', '--really-quiet', f'--volume={volume}', f.name],
                                    check=False, capture_output=True)
                 # Brief pause between clips
                 time.sleep(0.3)
@@ -216,7 +218,7 @@ class IrisServer:
             except queue.Empty:
                 break
 
-    def queue_speak(self, text: str, voice: str = KOKORO_VOICE, speed: float = 1.0):
+    def queue_speak(self, text: str, voice: str = KOKORO_VOICE, speed: float = 1.0, volume: int = KOKORO_VOLUME):
         """Request TTS from Kokoro and queue for playback."""
         # Don't queue new speech while CapsLock is held (user is speaking)
         if self.caps_lock_held:
@@ -248,7 +250,7 @@ class IrisServer:
                 timeout=30
             )
             if resp.status_code == 200:
-                self._audio_queue.put(resp.content)
+                self._audio_queue.put((resp.content, volume))
             else:
                 print(f"Kokoro TTS error: {resp.status_code}", flush=True)
         except Exception as e:
@@ -333,7 +335,7 @@ def health():
 
 @app.route('/speak', methods=['POST'])
 def speak():
-    """TTS endpoint. POST {"text": "...", "voice": "...", "speed": 1.0} -> queues audio"""
+    """TTS endpoint. POST {"text": "...", "voice": "...", "speed": 1.0, "volume": 70} -> queues audio"""
     data = request.get_json()
     if not data or 'text' not in data:
         return jsonify({"error": "missing 'text' field"}), 400
@@ -341,7 +343,8 @@ def speak():
     text = data['text']
     voice = data.get('voice', KOKORO_VOICE)
     speed = data.get('speed', 1.0)
-    server.queue_speak(text, voice=voice, speed=speed)
+    volume = data.get('volume', KOKORO_VOLUME)
+    server.queue_speak(text, voice=voice, speed=speed, volume=volume)
     return jsonify({"status": "queued"})
 
 

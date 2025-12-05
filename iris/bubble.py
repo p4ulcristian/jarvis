@@ -33,6 +33,9 @@ WARM_ORANGE = (1.0, 0.6, 0.2)
 GRAY_LIGHT = (0.5, 0.5, 0.55)
 GRAY_MID = (0.35, 0.35, 0.4)
 GRAY_DARK = (0.25, 0.25, 0.3)
+WARNING_RED = (1.0, 0.1, 0.1)
+WARNING_DARK = (0.9, 0.0, 0.0)
+WARNING_ACCENT = (1.0, 0.2, 0.1)
 
 # X button settings
 X_SIZE = 12
@@ -220,8 +223,13 @@ class IrisBubble(Gtk.Application):
         cr.paint()
         cr.set_operator(1)
 
-        # Determine colors based on state (listening > speaking > loading > idle)
-        if self.is_listening:
+        # Determine colors based on state
+        if self.is_listening and self.is_loading:
+            # Warning: trying to record while STT not ready
+            primary = WARNING_RED
+            secondary = WARNING_DARK
+            accent = WARNING_ACCENT
+        elif self.is_listening:
             primary = NEON_CYAN
             secondary = ELECTRIC_BLUE
             accent = NEON_MAGENTA
@@ -270,9 +278,11 @@ class IrisBubble(Gtk.Application):
 
             # Core gradient
             pattern = cairo.RadialGradient(cx - radius * 0.3, cy - radius * 0.3, 0, cx, cy, radius)
-            if self.is_speaking:
+            if self.is_listening and self.is_loading:
+                pattern.add_color_stop_rgba(0, 1.0, 0.7, 0.6, 1.0)  # Warning center
+            elif self.is_speaking:
                 pattern.add_color_stop_rgba(0, 1.0, 0.95, 0.7, 1.0)  # Warm center
-            elif self.is_loading and not self.is_listening:
+            elif self.is_loading:
                 pattern.add_color_stop_rgba(0, 0.6, 0.6, 0.65, 1.0)  # Gray center
             else:
                 pattern.add_color_stop_rgba(0, 0.7, 0.9, 1.0, 1.0)  # Cool center
@@ -284,9 +294,11 @@ class IrisBubble(Gtk.Application):
             cr.fill()
 
             # Inner shine
-            if self.is_speaking:
+            if self.is_listening and self.is_loading:
+                shine_color = (1.0, 0.8, 0.7)  # Warning
+            elif self.is_speaking:
                 shine_color = (1.0, 0.95, 0.8)  # Warm
-            elif self.is_loading and not self.is_listening:
+            elif self.is_loading:
                 shine_color = (0.8, 0.8, 0.85)  # Gray
             else:
                 shine_color = (0.8, 0.95, 1.0)  # Cool
@@ -323,13 +335,19 @@ class IrisBubble(Gtk.Application):
             cr.fill()
 
         # === LABEL with dark background ===
-        if self.is_loading and not self.is_listening:
+        if self.is_listening and self.is_loading:
+            label_text = "Wait" + "." * self.loading_dots
+        elif self.is_listening:
+            label_text = "Listening"
+        elif self.is_speaking:
+            label_text = "Speaking"
+        elif self.is_loading:
             if self.loading_what:
                 label_text = f"{self.loading_what}" + "." * self.loading_dots
             else:
                 label_text = "Loading" + "." * self.loading_dots
         else:
-            label_text = "Iris"
+            label_text = "Idle"
         label_y = cy + radius + 28  # Lower position
 
         cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
@@ -358,9 +376,11 @@ class IrisBubble(Gtk.Application):
         cr.fill()
 
         # Label color based on state
-        if self.is_speaking:
+        if self.is_listening and self.is_loading:
+            label_color = WARNING_RED
+        elif self.is_speaking:
             label_color = GOLD
-        elif self.is_loading and not self.is_listening:
+        elif self.is_loading:
             label_color = GRAY_LIGHT
         else:
             label_color = NEON_CYAN
