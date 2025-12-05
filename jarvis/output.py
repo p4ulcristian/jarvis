@@ -1,12 +1,15 @@
 """Output handling - clipboard and paste via wtype."""
 
 import os
+import time
 import subprocess
 
 OUTPUT_MODE = os.environ.get("JARVIS_OUTPUT_MODE", "clipboard")
 
 
 def paste_text(text: str):
+    # Small delay to let CapsLock fully release
+    time.sleep(0.1)
     if OUTPUT_MODE == "type":
         _type_direct(text)
     else:
