@@ -48,6 +48,11 @@ VOL_MARGIN_TOP = 35  # Below X button
 VOL_HIT_RADIUS = 15
 VOL_STATES = [100, 75, 50, 0]  # Cycle order
 
+# Position button settings
+POS_SIZE = 14
+POS_MARGIN_TOP = 58  # Below volume button
+POS_HIT_RADIUS = 15
+
 
 def find_keyboard():
     """Find a keyboard device."""
@@ -86,12 +91,10 @@ class IrisBubble(Gtk.Application):
         # Volume button
         self.vol_hovered = False
         self.volume = 100  # Current volume (0, 50, 75, 100)
-        # Dragging
-        self.is_dragging = False
-        self.drag_start_margin_top = MARGIN_TOP
-        self.drag_start_margin_right = MARGIN_RIGHT
-        self.margin_top = MARGIN_TOP
-        self.margin_right = MARGIN_RIGHT
+        # Position button
+        self.pos_hovered = False
+        self.position_index = 0  # Current position
+        self.position_overlay = None  # Overlay window for position selection
 
     def do_activate(self):
         self.window = Gtk.ApplicationWindow(application=self)
@@ -123,14 +126,6 @@ class IrisBubble(Gtk.Application):
         click_controller.connect('pressed', self.on_click)
         self.drawing_area.add_controller(click_controller)
 
-        # Drag gesture for moving the bubble
-        drag_controller = Gtk.GestureDrag()
-        drag_controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        drag_controller.connect('drag-begin', self.on_drag_begin)
-        drag_controller.connect('drag-update', self.on_drag_update)
-        drag_controller.connect('drag-end', self.on_drag_end)
-        self.window.add_controller(drag_controller)  # Add to window, not drawing_area
-
         self.load_css()
         self.start_evdev_listener()
         self.start_state_listener()
@@ -153,6 +148,9 @@ class IrisBubble(Gtk.Application):
     def get_vol_center(self):
         return (BUBBLE_SIZE - X_MARGIN - VOL_SIZE // 2, VOL_MARGIN_TOP + VOL_SIZE // 2)
 
+    def get_pos_center(self):
+        return (BUBBLE_SIZE - X_MARGIN - POS_SIZE // 2, POS_MARGIN_TOP + POS_SIZE // 2)
+
     def on_mouse_motion(self, controller, x, y):
         self.mouse_x = x
         self.mouse_y = y
@@ -164,12 +162,17 @@ class IrisBubble(Gtk.Application):
         v_cx, v_cy = self.get_vol_center()
         dist_vol = math.sqrt((x - v_cx) ** 2 + (y - v_cy) ** 2)
         self.vol_hovered = dist_vol <= VOL_HIT_RADIUS
+        # Position button hover
+        p_cx, p_cy = self.get_pos_center()
+        dist_pos = math.sqrt((x - p_cx) ** 2 + (y - p_cy) ** 2)
+        self.pos_hovered = dist_pos <= POS_HIT_RADIUS
 
     def on_mouse_leave(self, controller):
         self.mouse_x = -1
         self.mouse_y = -1
         self.x_hovered = False
         self.vol_hovered = False
+        self.pos_hovered = False
 
     def on_click(self, gesture, n_press, x, y):
         # X button
@@ -184,6 +187,12 @@ class IrisBubble(Gtk.Application):
         dist_vol = math.sqrt((x - v_cx) ** 2 + (y - v_cy) ** 2)
         if dist_vol <= VOL_HIT_RADIUS:
             self.cycle_volume()
+            return
+        # Position button
+        p_cx, p_cy = self.get_pos_center()
+        dist_pos = math.sqrt((x - p_cx) ** 2 + (y - p_cy) ** 2)
+        if dist_pos <= POS_HIT_RADIUS:
+            self.show_position_overlay()
 
     def cycle_volume(self):
         """Cycle through volume states and update server."""
@@ -200,50 +209,211 @@ class IrisBubble(Gtk.Application):
         except Exception:
             pass
 
-    def on_drag_begin(self, gesture, start_x, start_y):
-        """Start dragging - capture current margins."""
-        # Don't drag if clicking on X or volume button
-        x_cx, x_cy = self.get_x_center()
-        v_cx, v_cy = self.get_vol_center()
-        dist_x = math.sqrt((start_x - x_cx) ** 2 + (start_y - x_cy) ** 2)
-        dist_v = math.sqrt((start_x - v_cx) ** 2 + (start_y - v_cy) ** 2)
-        if dist_x <= X_HIT_RADIUS or dist_v <= VOL_HIT_RADIUS:
-            gesture.set_state(Gtk.EventSequenceState.DENIED)
-            return
-        # Get current margins from layer-shell
-        self.drag_start_margin_right = LayerShell.get_margin(self.window, LayerShell.Edge.RIGHT)
-        self.drag_start_margin_top = LayerShell.get_margin(self.window, LayerShell.Edge.TOP)
-        self.is_dragging = True
+    def set_position(self, pos_index):
+        """Set bubble to specific position index."""
+        display = self.window.get_display()
+        monitors = display.get_monitors()
+        n_monitors = monitors.get_n_items()
 
-    def on_drag_update(self, gesture, offset_x, offset_y):
-        """Update position while dragging."""
-        if not self.is_dragging:
-            return
+        monitor_idx = pos_index // 4
+        corner = pos_index % 4
 
-        # Get scale factor from widget
-        scale = self.window.get_scale_factor()
+        if monitor_idx >= n_monitors:
+            monitor_idx = 0
 
-        # Apply HiDPI correction
-        phys_x = offset_x * scale
-        phys_y = offset_y * scale
+        # Set monitor
+        monitor = monitors.get_item(monitor_idx)
+        LayerShell.set_monitor(self.window, monitor)
 
-        # Moving right decreases right margin, moving down increases top margin
-        new_right = int(self.drag_start_margin_right - phys_x)
-        new_top = int(self.drag_start_margin_top + phys_y)
+        # Set corner anchors
+        # 0: top-right, 1: bottom-right, 2: bottom-left, 3: top-left
+        top = corner in [0, 3]
+        bottom = corner in [1, 2]
+        left = corner in [2, 3]
+        right = corner in [0, 1]
 
-        # Clamp to reasonable bounds
-        new_right = max(0, new_right)
-        new_top = max(0, new_top)
+        LayerShell.set_anchor(self.window, LayerShell.Edge.TOP, top)
+        LayerShell.set_anchor(self.window, LayerShell.Edge.BOTTOM, bottom)
+        LayerShell.set_anchor(self.window, LayerShell.Edge.LEFT, left)
+        LayerShell.set_anchor(self.window, LayerShell.Edge.RIGHT, right)
 
-        LayerShell.set_margin(self.window, LayerShell.Edge.RIGHT, new_right)
-        LayerShell.set_margin(self.window, LayerShell.Edge.TOP, new_top)
+        # Set margins for the active edges
+        margin = MARGIN_TOP
+        LayerShell.set_margin(self.window, LayerShell.Edge.TOP, margin if top else 0)
+        LayerShell.set_margin(self.window, LayerShell.Edge.BOTTOM, margin if bottom else 0)
+        LayerShell.set_margin(self.window, LayerShell.Edge.LEFT, margin if left else 0)
+        LayerShell.set_margin(self.window, LayerShell.Edge.RIGHT, margin if right else 0)
 
-    def on_drag_end(self, gesture, offset_x, offset_y):
-        """Finish dragging."""
-        self.is_dragging = False
-        # Update stored margins
-        self.margin_right = LayerShell.get_margin(self.window, LayerShell.Edge.RIGHT)
-        self.margin_top = LayerShell.get_margin(self.window, LayerShell.Edge.TOP)
+        self.position_index = pos_index
+        corner_names = ["top-right", "bottom-right", "bottom-left", "top-left"]
+        print(f"Position: monitor {monitor_idx + 1}, {corner_names[corner]}", flush=True)
+
+    def show_position_overlay(self):
+        """Show fullscreen overlay for position selection."""
+        if self.position_overlay:
+            self.position_overlay.destroy()
+
+        self.position_overlay = Gtk.Window()
+        self.position_overlay.set_default_size(800, 400)
+
+        # Make it a layer-shell overlay
+        LayerShell.init_for_window(self.position_overlay)
+        LayerShell.set_layer(self.position_overlay, LayerShell.Layer.OVERLAY)
+        LayerShell.set_anchor(self.position_overlay, LayerShell.Edge.TOP, True)
+        LayerShell.set_anchor(self.position_overlay, LayerShell.Edge.BOTTOM, True)
+        LayerShell.set_anchor(self.position_overlay, LayerShell.Edge.LEFT, True)
+        LayerShell.set_anchor(self.position_overlay, LayerShell.Edge.RIGHT, True)
+        LayerShell.set_keyboard_mode(self.position_overlay, LayerShell.KeyboardMode.EXCLUSIVE)
+
+        # Drawing area for the overlay
+        drawing = Gtk.DrawingArea()
+        drawing.set_draw_func(self.draw_position_overlay)
+        self.position_overlay.set_child(drawing)
+
+        # Click handler
+        click = Gtk.GestureClick()
+        click.connect('pressed', self.on_overlay_click)
+        drawing.add_controller(click)
+
+        # Escape to close
+        key = Gtk.EventControllerKey()
+        key.connect('key-pressed', self.on_overlay_key)
+        self.position_overlay.add_controller(key)
+
+        self.position_overlay.present()
+
+    def draw_position_overlay(self, area, cr, width, height):
+        """Draw the position selection overlay."""
+        import cairo
+
+        # Semi-transparent dark background
+        cr.set_source_rgba(0, 0, 0, 0.85)
+        cr.paint()
+
+        # Get monitors
+        display = self.window.get_display()
+        monitors = display.get_monitors()
+        n_monitors = monitors.get_n_items()
+
+        # Calculate layout for monitor rectangles
+        padding = 40
+        gap = 30
+        available_w = width - padding * 2 - gap * (n_monitors - 1)
+        mon_w = min(400, available_w // n_monitors)
+        mon_h = int(mon_w * 0.6)  # 16:10 aspect ratio
+        total_w = mon_w * n_monitors + gap * (n_monitors - 1)
+        start_x = (width - total_w) // 2
+        start_y = (height - mon_h) // 2
+
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+
+        for i in range(n_monitors):
+            mx = start_x + i * (mon_w + gap)
+            my = start_y
+
+            # Monitor outline
+            cr.set_source_rgba(0.3, 0.3, 0.35, 1)
+            cr.rectangle(mx, my, mon_w, mon_h)
+            cr.fill()
+
+            cr.set_source_rgba(0.5, 0.5, 0.55, 1)
+            cr.set_line_width(2)
+            cr.rectangle(mx, my, mon_w, mon_h)
+            cr.stroke()
+
+            # Monitor label
+            cr.set_font_size(14)
+            label = f"Monitor {i + 1}"
+            ext = cr.text_extents(label)
+            cr.set_source_rgba(0.7, 0.7, 0.7, 1)
+            cr.move_to(mx + (mon_w - ext.width) / 2, my + mon_h + 25)
+            cr.show_text(label)
+
+            # Corner circles
+            corner_r = 20
+            corners = [
+                (mx + corner_r + 10, my + corner_r + 10, "TL"),  # top-left
+                (mx + mon_w - corner_r - 10, my + corner_r + 10, "TR"),  # top-right
+                (mx + corner_r + 10, my + mon_h - corner_r - 10, "BL"),  # bottom-left
+                (mx + mon_w - corner_r - 10, my + mon_h - corner_r - 10, "BR"),  # bottom-right
+            ]
+
+            for cx, cy, label in corners:
+                # Highlight current position
+                corner_idx = {"TR": 0, "BR": 1, "BL": 2, "TL": 3}[label]
+                is_current = (i * 4 + corner_idx) == self.position_index
+
+                if is_current:
+                    cr.set_source_rgba(*NEON_CYAN, 0.8)
+                else:
+                    cr.set_source_rgba(0.4, 0.4, 0.45, 1)
+                cr.arc(cx, cy, corner_r, 0, 2 * math.pi)
+                cr.fill()
+
+                # Corner label
+                cr.set_font_size(11)
+                ext = cr.text_extents(label)
+                cr.set_source_rgba(1, 1, 1, 0.9)
+                cr.move_to(cx - ext.width / 2, cy + ext.height / 2 - 1)
+                cr.show_text(label)
+
+        # Instructions
+        cr.set_font_size(16)
+        text = "Click a corner to move Iris • Press Escape to cancel"
+        ext = cr.text_extents(text)
+        cr.set_source_rgba(0.6, 0.6, 0.6, 1)
+        cr.move_to((width - ext.width) / 2, height - 30)
+        cr.show_text(text)
+
+    def on_overlay_click(self, gesture, n_press, x, y):
+        """Handle click on position overlay."""
+        display = self.window.get_display()
+        monitors = display.get_monitors()
+        n_monitors = monitors.get_n_items()
+
+        # Get overlay size
+        width = self.position_overlay.get_width()
+        height = self.position_overlay.get_height()
+
+        # Same layout calculation as drawing
+        padding = 40
+        gap = 30
+        available_w = width - padding * 2 - gap * (n_monitors - 1)
+        mon_w = min(400, available_w // n_monitors)
+        mon_h = int(mon_w * 0.6)
+        total_w = mon_w * n_monitors + gap * (n_monitors - 1)
+        start_x = (width - total_w) // 2
+        start_y = (height - mon_h) // 2
+
+        corner_r = 20
+
+        for i in range(n_monitors):
+            mx = start_x + i * (mon_w + gap)
+            my = start_y
+
+            corners = [
+                (mx + corner_r + 10, my + corner_r + 10, 3),  # TL
+                (mx + mon_w - corner_r - 10, my + corner_r + 10, 0),  # TR
+                (mx + corner_r + 10, my + mon_h - corner_r - 10, 2),  # BL
+                (mx + mon_w - corner_r - 10, my + mon_h - corner_r - 10, 1),  # BR
+            ]
+
+            for cx, cy, corner_idx in corners:
+                dist = math.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+                if dist <= corner_r + 5:
+                    pos_index = i * 4 + corner_idx
+                    self.set_position(pos_index)
+                    self.position_overlay.destroy()
+                    self.position_overlay = None
+                    return
+
+    def on_overlay_key(self, controller, keyval, keycode, state):
+        """Handle key press on overlay."""
+        if keyval == Gdk.KEY_Escape:
+            self.position_overlay.destroy()
+            self.position_overlay = None
+            return True
+        return False
 
     def start_evdev_listener(self):
         """Listen for CapsLock (user speaking)."""
@@ -566,6 +736,55 @@ class IrisBubble(Gtk.Application):
                 # Third wave (large)
                 cr.arc(wave_x, v_cy, 9, -0.5, 0.5)
                 cr.stroke()
+
+        # === POSITION BUTTON ===
+        p_cx, p_cy = self.get_pos_center()
+        pos_alpha = 0.9 if self.pos_hovered else 0.4
+
+        # Hover highlight
+        if self.pos_hovered:
+            cr.set_source_rgba(*NEON_CYAN, 0.4)
+            cr.arc(p_cx, p_cy, POS_HIT_RADIUS, 0, 2 * math.pi)
+            cr.fill()
+
+        cr.set_line_width(1.5 if self.pos_hovered else 1.2)
+        cr.set_source_rgba(1, 1, 1, pos_alpha)
+
+        # Draw move/grid icon (4 arrows pointing outward)
+        arr_len = 5
+        arr_gap = 3
+        # Up arrow
+        cr.move_to(p_cx, p_cy - arr_gap)
+        cr.line_to(p_cx, p_cy - arr_gap - arr_len)
+        cr.stroke()
+        cr.move_to(p_cx - 2, p_cy - arr_gap - arr_len + 2)
+        cr.line_to(p_cx, p_cy - arr_gap - arr_len)
+        cr.line_to(p_cx + 2, p_cy - arr_gap - arr_len + 2)
+        cr.stroke()
+        # Down arrow
+        cr.move_to(p_cx, p_cy + arr_gap)
+        cr.line_to(p_cx, p_cy + arr_gap + arr_len)
+        cr.stroke()
+        cr.move_to(p_cx - 2, p_cy + arr_gap + arr_len - 2)
+        cr.line_to(p_cx, p_cy + arr_gap + arr_len)
+        cr.line_to(p_cx + 2, p_cy + arr_gap + arr_len - 2)
+        cr.stroke()
+        # Left arrow
+        cr.move_to(p_cx - arr_gap, p_cy)
+        cr.line_to(p_cx - arr_gap - arr_len, p_cy)
+        cr.stroke()
+        cr.move_to(p_cx - arr_gap - arr_len + 2, p_cy - 2)
+        cr.line_to(p_cx - arr_gap - arr_len, p_cy)
+        cr.line_to(p_cx - arr_gap - arr_len + 2, p_cy + 2)
+        cr.stroke()
+        # Right arrow
+        cr.move_to(p_cx + arr_gap, p_cy)
+        cr.line_to(p_cx + arr_gap + arr_len, p_cy)
+        cr.stroke()
+        cr.move_to(p_cx + arr_gap + arr_len - 2, p_cy - 2)
+        cr.line_to(p_cx + arr_gap + arr_len, p_cy)
+        cr.line_to(p_cx + arr_gap + arr_len - 2, p_cy + 2)
+        cr.stroke()
 
 
 def main():
