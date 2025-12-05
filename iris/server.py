@@ -9,6 +9,8 @@ import threading
 import queue
 import subprocess
 import time
+import socket
+import json as jsonlib
 import requests
 from pathlib import Path
 
@@ -59,6 +61,7 @@ KOKORO_URL = "http://127.0.0.1:7123"
 KOKORO_START_SCRIPT = Path("/home/paul/Work/kokoro/start.sh")
 KOKORO_VOICE = "bf_isabella"
 KOKORO_VOLUME = 70  # Default volume (0-100)
+MPV_SOCKET = "/tmp/iris-mpv-socket"  # For real-time volume control
 
 # STT config
 STT_MODEL = "nvidia/canary-1b-v2"
@@ -169,6 +172,8 @@ class IrisServer:
         self.stt_ready = threading.Event()
         self.recorder = AudioRecorder()
         self.recording = False
+        self.volume = KOKORO_VOLUME  # Current volume level
+        self._mpv_proc = None  # Current mpv process for volume control
 
         # Audio playback queue
         self._audio_queue = queue.Queue()
@@ -190,14 +195,28 @@ class IrisServer:
             if item is None:  # Poison pill to clear queue
                 self._audio_queue.task_done()
                 continue
-            audio_bytes, volume = item
+            audio_bytes = item
             try:
                 set_state("speaking")
+                # Clean up old socket
+                if os.path.exists(MPV_SOCKET):
+                    os.remove(MPV_SOCKET)
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=True) as f:
                     f.write(audio_bytes)
                     f.flush()
-                    subprocess.run(['mpv', '--no-video', '--really-quiet', f'--volume={volume}', f.name],
-                                   check=False, capture_output=True)
+                    # Start mpv with IPC socket for real-time volume control
+                    proc = subprocess.Popen([
+                        'mpv', '--no-video', '--really-quiet',
+                        f'--volume={self.volume}',
+                        f'--input-ipc-server={MPV_SOCKET}',
+                        f.name
+                    ])
+                    self._mpv_proc = proc
+                    # Wait a moment for socket to be created, then set volume
+                    time.sleep(0.05)
+                    self._send_mpv_volume(self.volume)
+                    proc.wait()
+                    self._mpv_proc = None
                 # Brief pause between clips
                 time.sleep(0.3)
             except Exception as e:
@@ -205,6 +224,24 @@ class IrisServer:
             finally:
                 set_state("ready")
                 self._audio_queue.task_done()
+
+    def _send_mpv_volume(self, vol):
+        """Send volume command to mpv via IPC socket."""
+        try:
+            if not os.path.exists(MPV_SOCKET):
+                return
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(MPV_SOCKET)
+            cmd = jsonlib.dumps({"command": ["set_property", "volume", vol]}) + "\n"
+            sock.send(cmd.encode())
+            sock.close()
+        except Exception:
+            pass
+
+    def set_volume(self, vol):
+        """Set volume and update currently playing audio."""
+        self.volume = max(0, min(100, vol))
+        self._send_mpv_volume(self.volume)
 
     def stop_playback(self):
         """Stop all speech - kill mpv and clear queue."""
@@ -218,7 +255,7 @@ class IrisServer:
             except queue.Empty:
                 break
 
-    def queue_speak(self, text: str, voice: str = KOKORO_VOICE, speed: float = 1.0, volume: int = KOKORO_VOLUME):
+    def queue_speak(self, text: str, voice: str = KOKORO_VOICE, speed: float = 1.0):
         """Request TTS from Kokoro and queue for playback."""
         # Don't queue new speech while CapsLock is held (user is speaking)
         if self.caps_lock_held:
@@ -250,7 +287,7 @@ class IrisServer:
                 timeout=30
             )
             if resp.status_code == 200:
-                self._audio_queue.put((resp.content, volume))
+                self._audio_queue.put(resp.content)
             else:
                 print(f"Kokoro TTS error: {resp.status_code}", flush=True)
         except Exception as e:
@@ -343,9 +380,20 @@ def speak():
     text = data['text']
     voice = data.get('voice', KOKORO_VOICE)
     speed = data.get('speed', 1.0)
-    volume = data.get('volume', KOKORO_VOLUME)
-    server.queue_speak(text, voice=voice, speed=speed, volume=volume)
+    server.queue_speak(text, voice=voice, speed=speed)
     return jsonify({"status": "queued"})
+
+
+@app.route('/volume', methods=['GET', 'POST'])
+def volume():
+    """Get or set the default volume. POST {"volume": 0-100}"""
+    if request.method == 'GET':
+        return jsonify({"volume": server.volume})
+    data = request.get_json()
+    if data and 'volume' in data:
+        server.set_volume(int(data['volume']))
+        print(f"Volume set to {server.volume}%", flush=True)
+    return jsonify({"volume": server.volume})
 
 
 @app.route('/listen', methods=['POST'])

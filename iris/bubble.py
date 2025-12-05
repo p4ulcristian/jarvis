@@ -42,6 +42,12 @@ X_SIZE = 12
 X_MARGIN = 8
 X_HIT_RADIUS = 15
 
+# Volume button settings
+VOL_SIZE = 14
+VOL_MARGIN_TOP = 35  # Below X button
+VOL_HIT_RADIUS = 15
+VOL_STATES = [100, 75, 50, 0]  # Cycle order
+
 
 def find_keyboard():
     """Find a keyboard device."""
@@ -77,6 +83,9 @@ class IrisBubble(Gtk.Application):
         self.mouse_x = -1
         self.mouse_y = -1
         self.x_hovered = False
+        # Volume button
+        self.vol_hovered = False
+        self.volume = 100  # Current volume (0, 50, 75, 100)
 
     def do_activate(self):
         self.window = Gtk.ApplicationWindow(application=self)
@@ -127,24 +136,55 @@ class IrisBubble(Gtk.Application):
     def get_x_center(self):
         return (BUBBLE_SIZE - X_MARGIN - X_SIZE // 2, X_MARGIN + X_SIZE // 2)
 
+    def get_vol_center(self):
+        return (BUBBLE_SIZE - X_MARGIN - VOL_SIZE // 2, VOL_MARGIN_TOP + VOL_SIZE // 2)
+
     def on_mouse_motion(self, controller, x, y):
         self.mouse_x = x
         self.mouse_y = y
+        # X button hover
         x_cx, x_cy = self.get_x_center()
         dist = math.sqrt((x - x_cx) ** 2 + (y - x_cy) ** 2)
         self.x_hovered = dist <= X_HIT_RADIUS
+        # Volume button hover
+        v_cx, v_cy = self.get_vol_center()
+        dist_vol = math.sqrt((x - v_cx) ** 2 + (y - v_cy) ** 2)
+        self.vol_hovered = dist_vol <= VOL_HIT_RADIUS
 
     def on_mouse_leave(self, controller):
         self.mouse_x = -1
         self.mouse_y = -1
         self.x_hovered = False
+        self.vol_hovered = False
 
     def on_click(self, gesture, n_press, x, y):
+        # X button
         x_cx, x_cy = self.get_x_center()
         dist = math.sqrt((x - x_cx) ** 2 + (y - x_cy) ** 2)
         if dist <= X_HIT_RADIUS:
             print("X clicked - shutting down Iris", flush=True)
             os.kill(os.getppid(), signal.SIGTERM)
+            return
+        # Volume button
+        v_cx, v_cy = self.get_vol_center()
+        dist_vol = math.sqrt((x - v_cx) ** 2 + (y - v_cy) ** 2)
+        if dist_vol <= VOL_HIT_RADIUS:
+            self.cycle_volume()
+
+    def cycle_volume(self):
+        """Cycle through volume states and update server."""
+        try:
+            idx = VOL_STATES.index(self.volume)
+            self.volume = VOL_STATES[(idx + 1) % len(VOL_STATES)]
+        except ValueError:
+            self.volume = VOL_STATES[0]
+        print(f"Volume: {self.volume}%", flush=True)
+        # Update server volume
+        import requests
+        try:
+            requests.post("http://127.0.0.1:8765/volume", json={"volume": self.volume}, timeout=1)
+        except Exception:
+            pass
 
     def start_evdev_listener(self):
         """Listen for CapsLock (user speaking)."""
@@ -409,6 +449,64 @@ class IrisBubble(Gtk.Application):
         cr.move_to(x_cx + half, x_cy - half)
         cr.line_to(x_cx - half, x_cy + half)
         cr.stroke()
+
+        # === VOLUME BUTTON ===
+        v_cx, v_cy = self.get_vol_center()
+        vol_alpha = 0.9 if self.vol_hovered else 0.4
+
+        # Hover highlight
+        if self.vol_hovered:
+            cr.set_source_rgba(*NEON_CYAN, 0.4)
+            cr.arc(v_cx, v_cy, VOL_HIT_RADIUS, 0, 2 * math.pi)
+            cr.fill()
+
+        cr.set_line_width(2.0 if self.vol_hovered else 1.5)
+        cr.set_line_cap(1)
+        cr.set_source_rgba(1, 1, 1, vol_alpha)
+
+        # Draw speaker icon
+        spk_w = 6  # Speaker body width
+        spk_h = 8  # Speaker body height
+        spk_x = v_cx - 5  # Left edge of speaker
+
+        # Speaker body (rectangle)
+        cr.rectangle(spk_x, v_cy - spk_h / 4, spk_w / 2, spk_h / 2)
+        cr.fill()
+
+        # Speaker cone (triangle)
+        cr.move_to(spk_x + spk_w / 2, v_cy - spk_h / 4)
+        cr.line_to(spk_x + spk_w, v_cy - spk_h / 2)
+        cr.line_to(spk_x + spk_w, v_cy + spk_h / 2)
+        cr.line_to(spk_x + spk_w / 2, v_cy + spk_h / 4)
+        cr.close_path()
+        cr.fill()
+
+        # Sound waves or mute X based on volume
+        wave_x = spk_x + spk_w + 3
+        if self.volume == 0:
+            # Draw X for mute
+            cr.set_line_width(2.0)
+            cr.move_to(wave_x, v_cy - 4)
+            cr.line_to(wave_x + 6, v_cy + 4)
+            cr.stroke()
+            cr.move_to(wave_x + 6, v_cy - 4)
+            cr.line_to(wave_x, v_cy + 4)
+            cr.stroke()
+        else:
+            # Draw sound waves based on volume level
+            cr.set_line_width(1.5)
+            if self.volume >= 50:
+                # First wave (small)
+                cr.arc(wave_x, v_cy, 3, -0.5, 0.5)
+                cr.stroke()
+            if self.volume >= 75:
+                # Second wave (medium)
+                cr.arc(wave_x, v_cy, 6, -0.5, 0.5)
+                cr.stroke()
+            if self.volume >= 100:
+                # Third wave (large)
+                cr.arc(wave_x, v_cy, 9, -0.5, 0.5)
+                cr.stroke()
 
 
 def main():
