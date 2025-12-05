@@ -8,10 +8,12 @@ dependencies = [
     "sounddevice",
     "numpy",
     "evdev",
+    "flask",
+    "librosa",
 ]
 
 [project.scripts]
-jarvis = "jarvis.daemon:main"
+jarvis = "jarvis.server:main"
 
 [tool.setuptools.packages.find]
 include = ["jarvis*"]

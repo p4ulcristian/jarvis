@@ -1,8 +1,8 @@
 #!/bin/bash
 # Usage: ./speak.sh "text to speak"
-# Uses local FastPitch + HiFi-GAN via NeMo (no API needed)
+# Sends text to Jarvis server for TTS (server plays audio)
 
-cd "$(dirname "$0")"
+SERVER="http://127.0.0.1:8765"
 
 TEXT="$1"
 if [ -z "$TEXT" ]; then
@@ -10,4 +10,6 @@ if [ -z "$TEXT" ]; then
     exit 1
 fi
 
-.venv/bin/python -m jarvis.tts "$TEXT"
+curl -s -X POST "$SERVER/speak" \
+    -H "Content-Type: application/json" \
+    -d "{\"text\": \"$TEXT\"}"

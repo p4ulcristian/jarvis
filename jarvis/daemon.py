@@ -1,18 +1,15 @@
-"""Main daemon - PTT with evdev hotkey."""
+"""Main daemon - PTT via keyd signals."""
 
 import os
 import signal
 import sys
 from pathlib import Path
-from evdev import ecodes
 
 from jarvis.audio import AudioRecorder
 from jarvis.stt import SpeechToText
 from jarvis.output import paste_text
-from jarvis.hotkey import start_hotkey_thread
 
 PID_FILE = Path("/tmp/jarvis.pid")
-HOTKEY = ecodes.KEY_CAPSLOCK
 
 
 class Daemon:
@@ -21,14 +18,14 @@ class Daemon:
         self.stt = SpeechToText()
         self.recording = False
 
-    def start_recording(self):
+    def start_recording(self, signum=None, frame=None):
         if self.recording:
             return
         self.recording = True
         print("Recording...", flush=True)
         self.recorder.start()
 
-    def stop_recording(self):
+    def stop_recording(self, signum=None, frame=None):
         if not self.recording:
             return
         self.recording = False
@@ -49,28 +46,29 @@ class Daemon:
         sys.exit(0)
 
     def run(self):
-        PID_FILE.write_text(str(os.getpid()))
-
+        # Signal handlers for keyd integration
+        signal.signal(signal.SIGUSR1, self.start_recording)  # CapsLock press
+        signal.signal(signal.SIGUSR2, self.stop_recording)   # CapsLock release
         signal.signal(signal.SIGTERM, self.shutdown)
         signal.signal(signal.SIGINT, self.shutdown)
 
-        print(f"Jarvis daemon running (PID: {os.getpid()})", flush=True)
+        print(f"Jarvis ready (PID: {os.getpid()})", flush=True)
         print("Hold CapsLock to record...", flush=True)
 
-        # Start hotkey listener
-        start_hotkey_thread(
-            HOTKEY,
-            on_press=self.start_recording,
-            on_release=self.stop_recording
-        )
-
-        # Keep main thread alive
-        signal.pause()
+        # Keep main thread alive, waiting for signals
+        while True:
+            signal.pause()
 
 
 def main():
-    daemon = Daemon()
-    daemon.run()
+    # Write PID immediately so keyd can signal us while model loads
+    PID_FILE.write_text(str(os.getpid()))
+
+    try:
+        daemon = Daemon()
+        daemon.run()
+    finally:
+        PID_FILE.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

@@ -4,8 +4,8 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/Think/work/jarvis
-ExecStart=%h/Think/work/jarvis/.venv/bin/python -m jarvis.daemon
+WorkingDirectory=%h/Work/jarvis
+ExecStart=%h/Work/jarvis/.venv/bin/python -m jarvis.daemon
 Restart=on-failure
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
