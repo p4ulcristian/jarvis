@@ -70,6 +70,10 @@ def _quiet():
 
 
 kokoro_process = None  # Track if we started Kokoro
+bubble_process = None  # Track bubble overlay process
+
+# Bubble config
+BUBBLE_SCRIPT = Path(__file__).parent / "bubble.py"
 
 
 def ensure_kokoro_running():
@@ -79,6 +83,7 @@ def ensure_kokoro_running():
         resp = requests.get(f"{KOKORO_URL}/health", timeout=1)
         if resp.status_code == 200:
             print("Kokoro TTS already running", flush=True)
+            print("🔊 Ready to speak", flush=True)
             return True
     except requests.exceptions.ConnectionError:
         pass
@@ -98,6 +103,7 @@ def ensure_kokoro_running():
             resp = requests.get(f"{KOKORO_URL}/health", timeout=1)
             if resp.status_code == 200:
                 print("Kokoro TTS ready", flush=True)
+                print("🔊 Ready to speak", flush=True)
                 return True
         except requests.exceptions.ConnectionError:
             pass
@@ -116,6 +122,34 @@ def stop_kokoro():
         except (ProcessLookupError, OSError):
             pass
         kokoro_process = None
+
+
+def start_bubble():
+    """Start the bubble overlay."""
+    global bubble_process
+    print("Starting bubble overlay...", flush=True)
+    env = os.environ.copy()
+    env['LD_PRELOAD'] = '/usr/lib/libgtk4-layer-shell.so'
+    bubble_process = subprocess.Popen(
+        ['python3', str(BUBBLE_SCRIPT)],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True
+    )
+    print("Bubble overlay started", flush=True)
+
+
+def stop_bubble():
+    """Stop the bubble overlay if we started it."""
+    global bubble_process
+    if bubble_process is not None:
+        print("Stopping bubble overlay...", flush=True)
+        try:
+            os.killpg(os.getpgid(bubble_process.pid), signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+        bubble_process = None
 
 
 class JarvisServer:
@@ -200,6 +234,7 @@ class JarvisServer:
                 self.stt_model = self.stt_model.half().cuda()
                 self.stt_model.eval()
             print("STT ready", flush=True)
+            print("👂 Ready to listen", flush=True)
         finally:
             self.stt_ready.set()
 
@@ -328,6 +363,7 @@ def shutdown(signum, frame):
     print("\nShutting down...", flush=True)
     if server:
         server.cleanup()
+    stop_bubble()
     stop_kokoro()
     PID_FILE.unlink(missing_ok=True)
     sys.exit(0)
@@ -343,6 +379,9 @@ def main():
     try:
         # Start Kokoro TTS if needed
         ensure_kokoro_running()
+
+        # Start bubble overlay
+        start_bubble()
 
         # Load STT model
         server = JarvisServer()
@@ -373,6 +412,7 @@ def main():
             ptt_listener.stop()
         if server:
             server.cleanup()
+        stop_bubble()
         stop_kokoro()
         PID_FILE.unlink(missing_ok=True)
 
