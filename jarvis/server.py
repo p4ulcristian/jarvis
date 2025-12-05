@@ -1,4 +1,4 @@
-"""Unified Jarvis server - STT + TTS with HTTP API."""
+"""Unified Jarvis server - STT (NeMo) + TTS (Kokoro) with HTTP API."""
 
 import os
 import sys
@@ -8,6 +8,8 @@ import tempfile
 import threading
 import queue
 import subprocess
+import time
+import requests
 from pathlib import Path
 
 # Suppress NeMo logging spam before imports
@@ -27,7 +29,6 @@ import numpy as np
 import soundfile as sf
 from flask import Flask, request, jsonify
 from nemo.collections.asr.models import EncDecMultiTaskModel
-from nemo.collections.tts.models import FastPitchModel, HifiGanModel
 
 sys.stdout, sys.stderr = _stdout, _stderr
 logging.disable(logging.NOTSET)
@@ -44,12 +45,14 @@ HOST = "127.0.0.1"
 PORT = 8765
 PID_FILE = Path("/tmp/jarvis.pid")
 
-# Models
+# Kokoro TTS config
+KOKORO_URL = "http://127.0.0.1:7123"
+KOKORO_START_SCRIPT = Path("/home/paul/Work/kokoro/start.sh")
+KOKORO_VOICE = "bf_isabella"
+
+# STT config
 STT_MODEL = "nvidia/canary-1b-v2"
-TTS_FASTPITCH = "nvidia/tts_en_fastpitch"
-TTS_HIFIGAN = "nvidia/tts_hifigan"
 STT_SAMPLE_RATE = 16000
-TTS_SAMPLE_RATE = 22050
 
 app = Flask(__name__)
 
@@ -66,14 +69,45 @@ def _quiet():
     return Quiet()
 
 
+def ensure_kokoro_running():
+    """Start Kokoro TTS server if not already running."""
+    try:
+        resp = requests.get(f"{KOKORO_URL}/health", timeout=1)
+        if resp.status_code == 200:
+            print("Kokoro TTS already running", flush=True)
+            return True
+    except requests.exceptions.ConnectionError:
+        pass
+
+    print("Starting Kokoro TTS server...", flush=True)
+    subprocess.Popen(
+        [str(KOKORO_START_SCRIPT)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True
+    )
+
+    # Wait for Kokoro to be ready
+    for _ in range(60):  # Wait up to 60 seconds
+        time.sleep(1)
+        try:
+            resp = requests.get(f"{KOKORO_URL}/health", timeout=1)
+            if resp.status_code == 200:
+                print("Kokoro TTS ready", flush=True)
+                return True
+        except requests.exceptions.ConnectionError:
+            pass
+
+    print("Warning: Kokoro TTS failed to start", flush=True)
+    return False
+
+
 class JarvisServer:
     def __init__(self):
         self.stt_model = None
-        self.tts_spec = None
-        self.tts_vocoder = None
         self.recorder = AudioRecorder()
         self.recording = False
-        self._load_models()
+        self._load_stt_model()
 
         # Audio playback queue
         self._audio_queue = queue.Queue()
@@ -90,34 +124,44 @@ class JarvisServer:
                     f.flush()
                     subprocess.run(['mpv', '--no-video', '--really-quiet', f.name],
                                    check=False, capture_output=True)
+                # Brief pause between clips
+                time.sleep(0.3)
             except Exception as e:
                 print(f"Playback error: {e}", flush=True)
             finally:
                 self._audio_queue.task_done()
 
-    def queue_speak(self, text: str):
-        """Synthesize text and queue for playback."""
-        audio_buffer = self.synthesize(text)
-        self._audio_queue.put(audio_buffer.read())
+    def queue_speak(self, text: str, voice: str = KOKORO_VOICE, speed: float = 1.0):
+        """Request TTS from Kokoro and queue for playback."""
+        # Clean text: replace newlines/tabs with spaces, collapse multiple spaces
+        import re
+        # Handle both literal \n strings and actual newlines
+        text = text.replace('\\n', ' ').replace('\\r', ' ').replace('\\t', ' ')
+        text = re.sub(r'[\n\r\t]+', ' ', text)
+        text = re.sub(r' +', ' ', text).strip()
+        if not text:
+            return
 
-    def _load_models(self):
+        try:
+            resp = requests.post(
+                f"{KOKORO_URL}/speak",
+                json={"text": text, "voice": voice, "speed": speed},
+                timeout=30
+            )
+            if resp.status_code == 200:
+                self._audio_queue.put(resp.content)
+            else:
+                print(f"Kokoro TTS error: {resp.status_code}", flush=True)
+        except Exception as e:
+            print(f"TTS error: {e}", flush=True)
+
+    def _load_stt_model(self):
         print("Loading STT model (Canary)...", flush=True)
         with _quiet():
             self.stt_model = EncDecMultiTaskModel.from_pretrained(STT_MODEL, map_location='cpu')
             self.stt_model = self.stt_model.half().cuda()
             self.stt_model.eval()
         print("STT ready", flush=True)
-
-        print("Loading TTS models (FastPitch + HiFi-GAN)...", flush=True)
-        with _quiet():
-            self.tts_spec = FastPitchModel.from_pretrained(TTS_FASTPITCH)
-            self.tts_spec = self.tts_spec.half().cuda()
-            self.tts_spec.eval()
-
-            self.tts_vocoder = HifiGanModel.from_pretrained(TTS_HIFIGAN)
-            self.tts_vocoder = self.tts_vocoder.half().cuda()
-            self.tts_vocoder.eval()
-        print("TTS ready", flush=True)
 
     def transcribe(self, audio: np.ndarray) -> str:
         """Transcribe audio to text."""
@@ -130,20 +174,6 @@ class JarvisServer:
             text = hyp.text if hasattr(hyp, 'text') else str(hyp)
             return text.strip()
         return ""
-
-    def synthesize(self, text: str) -> bytes:
-        """Convert text to speech, return WAV bytes."""
-        with torch.no_grad():
-            parsed = self.tts_spec.parse(text)
-            spectrogram = self.tts_spec.generate_spectrogram(tokens=parsed)
-            audio = self.tts_vocoder.convert_spectrogram_to_audio(spec=spectrogram)
-        audio_np = audio.cpu().float().numpy()[0]
-
-        import io
-        buffer = io.BytesIO()
-        sf.write(buffer, audio_np, TTS_SAMPLE_RATE, format='WAV')
-        buffer.seek(0)
-        return buffer
 
     def start_recording(self):
         if self.recording:
@@ -177,13 +207,15 @@ def health():
 
 @app.route('/speak', methods=['POST'])
 def speak():
-    """TTS endpoint. POST {"text": "..."} -> queues audio for playback"""
+    """TTS endpoint. POST {"text": "...", "voice": "...", "speed": 1.0} -> queues audio"""
     data = request.get_json()
     if not data or 'text' not in data:
         return jsonify({"error": "missing 'text' field"}), 400
 
     text = data['text']
-    server.queue_speak(text)
+    voice = data.get('voice', KOKORO_VOICE)
+    speed = data.get('speed', 1.0)
+    server.queue_speak(text, voice=voice, speed=speed)
     return jsonify({"status": "queued"})
 
 
@@ -249,6 +281,10 @@ def main():
 
     ptt_listener = None
     try:
+        # Start Kokoro TTS if needed
+        ensure_kokoro_running()
+
+        # Load STT model
         server = JarvisServer()
 
         # Start PTT listener (evdev-based, no device grab)
